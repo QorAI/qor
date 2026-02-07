@@ -1,0 +1,51 @@
+# QOR — The Qore Mind
+# =====================
+#
+# QUICK INSTALL (minimum):
+#   pip install torch tokenizers flask flask-cors
+#
+# RECOMMENDED INSTALL (most features):
+#   pip install torch tokenizers flask flask-cors duckduckgo-search datasets
+#
+# FULL INSTALL (everything):
+#   pip install -r requirements.txt
+
+# ============================================================
+# REQUIRED — You need these to run QOR at all
+# ============================================================
+torch>=2.0.0                # Core ML framework (the brain)
+tokenizers>=0.19.0          # BPE tokenizer (vocabulary builder)
+
+# ============================================================
+# API SERVER — Pick one (Flask is simpler, FastAPI is faster)
+# ============================================================
+flask>=3.0.0                # Simple API server
+flask-cors>=4.0.0           # Allow cross-origin requests
+# fastapi>=0.110.0          # Production API server (alternative)
+# uvicorn>=0.29.0           # ASGI server for FastAPI
+
+# ============================================================
+# ZERO HALLUCINATION — Tools for live data and search
+# ============================================================
+duckduckgo-search>=6.0.0    # Free web search (no API key needed)
+# yfinance>=0.2.36          # Stock price lookup (free)
+# requests>=2.31.0          # HTTP requests for custom APIs
+
+# ============================================================
+# TRAINING DATA — Download free datasets
+# ============================================================
+datasets>=2.19.0            # HuggingFace datasets (Wikipedia, TinyStories, etc.)
+
+# ============================================================
+# EXPORT & SHARING — Publish your model
+# ============================================================
+# safetensors>=0.4.0        # Safe model weight format
+# huggingface_hub>=0.22.0   # Push models to HuggingFace Hub
+# gradio>=4.0.0             # Web UI demo
+# onnx>=1.16.0              # Export to ONNX format
+
+# ============================================================
+# MONITORING — Track training progress
+# ============================================================
+# wandb>=0.16.0             # Experiment tracking (wandb.ai)
+# tensorboard>=2.16.0       # Training visualization
