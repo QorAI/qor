@@ -164,17 +164,27 @@ def create_agent(
             print(f"  RAG: no documents (add .txt files to {knowledge_dir}/)")
 
     # ------------------------------------------------------------------
-    # 8. TOOLS (30+ free APIs)
+    # 8. TOOLS (plugin system — add/edit without touching model)
     # ------------------------------------------------------------------
-    tool_executor = ToolExecutor()
-    tool_executor.register_all(gate)
+    from qor.plugins import PluginManager
+    plugin_mgr = PluginManager(
+        plugins_dir=os.path.join(os.path.dirname(knowledge_dir), "plugins"),
+        config_path=os.path.join(os.path.dirname(knowledge_dir), "tools_config"),
+    )
+    plugin_mgr.load_all(include_builtins=True)
+    plugin_mgr.register_with_gate(gate)
 
-    # Store executor on gate for direct access
+    # Also keep the static executor for detect_intent
+    tool_executor = ToolExecutor()
+
+    # Store on gate for access
     gate._tool_executor = tool_executor
+    gate._plugin_manager = plugin_mgr
     gate._knowledge_base = kb
 
     if verbose:
-        print(f"  Tools: {len(tool_executor.tools)} registered")
+        print(f"  Tools: {len(plugin_mgr.tools)} loaded "
+              f"(drop .py files in plugins/ to add more)")
         print(f"\n  Memory: {len(gate.memory.entries)} entries "
               f"(from {memory_path})")
 

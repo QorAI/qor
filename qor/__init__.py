@@ -32,8 +32,14 @@ def __getattr__(name):
         from .setup import add_knowledge
         return add_knowledge
     if name == "add_tool":
-        from .setup import add_tool
+        from .plugins import add_tool
         return add_tool
+    if name == "add_api_tool":
+        from .plugins import add_api_tool
+        return add_api_tool
+    if name == "remove_tool":
+        from .plugins import remove_tool
+        return remove_tool
     if name == "agent_stats":
         from .setup import agent_stats
         return agent_stats
@@ -41,5 +47,6 @@ def __getattr__(name):
 
 __all__ = [
     "QORConfig", "QORModel", "QORTokenizer",
-    "create_agent", "add_knowledge", "add_tool", "agent_stats",
+    "create_agent", "add_knowledge", "add_tool", "add_api_tool",
+    "remove_tool", "agent_stats",
 ]
