@@ -1,4 +1,4 @@
-# QOR — The Qore Mind
+# QOR — The Mind
 
 **A self-aware AI that knows what it knows, knows what it doesn't, and never guesses.**
 
