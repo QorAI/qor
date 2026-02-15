@@ -1,0 +1,97 @@
+# QOR — The Qore Mind
+# =====================
+#
+# QUICK INSTALL (minimum):
+#   pip install torch tokenizers flask flask-cors
+#
+# RECOMMENDED INSTALL (most features):
+#   pip install torch tokenizers flask flask-cors duckduckgo-search datasets
+#
+# FULL INSTALL (everything):
+#   pip install -r requirements.txt
+
+# ============================================================
+# REQUIRED — You need these to run QOR at all
+# ============================================================
+torch>=2.0.0                # Core ML framework (the brain)
+tokenizers>=0.19.0          # BPE tokenizer (vocabulary builder)
+pyarrow>=15.0.0             # Arrow/Parquet for MemoryStore + batch files
+psutil>=5.9.0               # System monitoring (RAM, processes)
+numpy>=1.24.0               # Numerical computing (used everywhere)
+
+# ============================================================
+# API SERVER — Pick one (Flask is simpler, FastAPI is faster)
+# ============================================================
+flask>=3.0.0                # Simple API server
+flask-cors>=4.0.0           # Allow cross-origin requests
+# fastapi>=0.110.0          # Production API server (alternative)
+# uvicorn>=0.29.0           # ASGI server for FastAPI
+
+# ============================================================
+# ZERO HALLUCINATION — Tools for live data and search
+# ============================================================
+duckduckgo-search>=6.0.0    # Free web search (no API key needed)
+requests>=2.31.0            # HTTP requests for APIs
+yfinance>=0.2.36            # Stock/commodity/forex data (Yahoo Finance)
+
+# ============================================================
+# TRAINING DATA — Download free datasets
+# ============================================================
+datasets>=2.19.0            # HuggingFace datasets (Wikipedia, TinyStories, etc.)
+
+# ============================================================
+# KNOWLEDGE GRAPH — RocksDB-backed persistent graph storage
+# ============================================================
+rocksdict>=0.3.0            # RocksDB binding (Rust-based, works on Windows)
+msgpack>=1.0.0              # Fast binary serialization for graph data
+
+# ============================================================
+# CfC LIQUID NEURONS — Enable with use_cfc=True
+# ============================================================
+ncps>=0.0.7                 # CfC-mmRNN liquid neurons (Nature MI 2022)
+
+# ============================================================
+# VOICE — Speech-to-text (Whisper) + Text-to-speech (Edge TTS)
+# ============================================================
+transformers>=4.40.0        # Whisper model for speech recognition
+soundfile>=0.12.0           # Read WAV/FLAC audio (no ffmpeg needed)
+scipy>=1.11.0               # Audio resampling for Whisper (16kHz)
+edge-tts>=6.1.0             # Microsoft Edge TTS (free, human-like voices)
+
+# ============================================================
+# MULTIMODAL — Vision + Audio encoders
+# ============================================================
+# transformers already listed above (SigLIP + Whisper + BLIP)
+Pillow>=10.0.0              # Image processing (BLIP vision model)
+opencv-python>=4.8.0        # Video frame extraction
+# yt-dlp>=2024.0            # Video URL download (optional)
+
+# ============================================================
+# DOCUMENTS — PDF/DOCX text extraction
+# ============================================================
+pymupdf>=1.24.0             # PDF extraction (fast, C-based)
+python-docx>=1.0.0          # DOCX paragraph extraction
+
+# ============================================================
+# BROWSER AUTOMATION — Headless Chromium
+# ============================================================
+playwright>=1.40.0          # Browser automation (run: playwright install chromium)
+
+# ============================================================
+# ENCRYPTION — At-rest data protection
+# ============================================================
+cryptography>=42.0.0        # Fernet (AES-128-CBC) for chat + API credentials
+
+# ============================================================
+# EXPORT & SHARING
+# ============================================================
+# safetensors>=0.4.0        # Safe model weight format
+# huggingface_hub>=0.22.0   # Push models to HuggingFace Hub
+# gradio>=4.0.0             # Web UI demo
+# onnx>=1.16.0              # Export to ONNX format
+
+# ============================================================
+# MONITORING — Track training progress
+# ============================================================
+# wandb>=0.16.0             # Experiment tracking (wandb.ai)
+# tensorboard>=2.16.0       # Training visualization
