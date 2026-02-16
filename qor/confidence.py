@@ -1214,29 +1214,78 @@ class ConfidenceGate:
             if verbose:
                 print(f"\n  ┌─ Query: {question}")
 
+        import time as _time
+        _t_start = _time.time()
+
         # Fast path: greetings/casual chat — skip EVERYTHING (no classify, no DB, no tools).
-        # Uses /no_think so model responds directly without extended reasoning.
-        # Identity personality guide loaded from knowledge/identity.txt for human-like responses.
         _q_stripped = resolved_question.strip().lower().rstrip("!?.,")
-        _GREETINGS = {"hi", "hello", "hey", "howdy", "hola", "yo", "sup",
-                       "good morning", "good afternoon", "good evening",
-                       "good night", "gm", "whats up", "what's up",
-                       "how are you", "how r u", "how are u",
-                       "how's it going", "hows it going", "hey there",
-                       "hi there", "hello there", "thanks", "thank you",
-                       "bye", "goodbye", "see you", "ok", "okay",
-                       "nice", "cool", "great", "awesome", "good", "fine",
-                       "not bad", "alright", "yep", "nope", "lol", "haha",
-                       "what's your name", "whats your name", "who are you",
-                       "what are you", "what can you do", "help",
-                       "tell me about yourself", "introduce yourself"}
-        _is_casual = (_q_stripped in _GREETINGS
-                      or (len(_q_stripped) < 15 and any(_q_stripped.startswith(g)
-                          for g in {"hi ", "hey ", "hello ", "yo ", "thanks ",
-                                    "good ", "bye ", "who are", "what's your",
-                                    "whats your", "what are", "tell me about"})))
+
+        # INSTANT replies — no model call, no lock, returns in <1ms
+        # These are trivial greetings where model generation adds nothing
+        _INSTANT = {"hi", "hello", "hey", "howdy", "hola", "yo", "sup",
+                     "good morning", "good afternoon", "good evening",
+                     "good night", "gm", "thanks", "thank you",
+                     "bye", "goodbye", "see you", "ok", "okay",
+                     "nice", "cool", "great", "awesome", "good", "fine",
+                     "not bad", "alright", "yep", "nope", "lol", "haha"}
+        _INSTANT_PREFIXES = {"hi ", "hey ", "hello ", "yo ", "thanks ",
+                              "good ", "bye "}
+        _is_instant = (_q_stripped in _INSTANT
+                       or (len(_q_stripped) < 15 and any(
+                           _q_stripped.startswith(g) for g in _INSTANT_PREFIXES)))
+        if _is_instant:
+            # Canned responses — zero latency, no model lock contention
+            import random
+            _uname = getattr(self, '_user_name', '')
+            _name_str = f" {_uname}" if _uname else ""
+            if _q_stripped in ("bye", "goodbye", "see you") or _q_stripped.startswith("bye "):
+                _replies = [f"See you later{_name_str}!", f"Goodbye{_name_str}! Take care.",
+                           f"Catch you next time{_name_str}!"]
+            elif _q_stripped in ("thanks", "thank you") or _q_stripped.startswith("thanks "):
+                _replies = ["You're welcome!", "Happy to help!", "Anytime!",
+                           f"No problem{_name_str}!"]
+            elif _q_stripped in ("ok", "okay", "nice", "cool", "great",
+                                 "awesome", "good", "fine", "not bad",
+                                 "alright", "yep", "nope", "lol", "haha"):
+                _replies = ["What else can I help with?",
+                           f"Anything else{_name_str}?",
+                           "Let me know if you need anything!"]
+            else:
+                _replies = [f"Hey{_name_str}! What's on your mind?",
+                           f"Hi{_name_str}! How can I help?",
+                           f"Hello{_name_str}! What would you like to know?",
+                           f"Hey there{_name_str}! Ask me anything."]
+            _reply = random.choice(_replies)
+            _elapsed = (_time.time() - _t_start) * 1000
+            if verbose:
+                print(f"  ├─ Instant path: {_elapsed:.0f}ms (no model)")
+                print(f"  └─ Answer: {_reply}")
+            return {
+                "question": question,
+                "answer": _reply,
+                "confidence": 0.99,
+                "source": "internal",
+                "sources": [],
+                "sources_used": ["instant_greeting"],
+                "reasoning": "trivial greeting — instant canned reply, no model lock",
+                "timestamp": datetime.now().isoformat(),
+                "tool_context": [],
+            }
+
+        # MODEL path: casual queries that need the model (who are you, what can you do)
+        _CASUAL_MODEL = {"whats up", "what's up", "how are you", "how r u",
+                          "how are u", "how's it going", "hows it going",
+                          "hey there", "hi there", "hello there",
+                          "what's your name", "whats your name", "who are you",
+                          "what are you", "what can you do", "help",
+                          "tell me about yourself", "introduce yourself"}
+        _CASUAL_PREFIXES = {"who are", "what's your", "whats your",
+                             "what are", "tell me about"}
+        _is_casual = (_q_stripped in _CASUAL_MODEL
+                      or (len(_q_stripped) < 25 and any(
+                          _q_stripped.startswith(g) for g in _CASUAL_PREFIXES)))
         if _is_casual:
-            # Build identity: system prompt (name + interests) + personality from identity.txt
+            # Build identity: system prompt + personality from identity.txt
             identity = getattr(self, 'system_prompt',
                                "You are QOR (Qora Neuran AI), a helpful AI assistant.")
 
@@ -1253,11 +1302,16 @@ class ConfidenceGate:
                 except Exception:
                     pass
             if self._identity_text:
-                identity += "\n\n" + self._identity_text
+                _id_text = self._identity_text
+                _uname = getattr(self, '_user_name', '')
+                if _uname:
+                    _id_text = _id_text.replace('{name}', _uname)
+                else:
+                    _id_text = _id_text.replace('{name}', '')
+                identity += "\n\n" + _id_text
 
             identity += "\n/no_think"
 
-            # Include chat history so model can reference past conversations
             chat_turns = []
             if chat_context:
                 for msg in chat_context[-4:]:
@@ -1265,9 +1319,13 @@ class ConfidenceGate:
             messages = [{"role": "system", "content": identity}]
             messages.extend(chat_turns)
             messages.append({"role": "user", "content": question})
-            greeting_reply = self._generate(messages, max_new_tokens=80, temperature=0.8)
+            _t_gen = _time.time()
+            greeting_reply = self._generate(messages, max_new_tokens=40, temperature=0.8)
+            _gen_ms = (_time.time() - _t_gen) * 1000
+            _total_ms = (_time.time() - _t_start) * 1000
             if verbose:
-                print(f"  ├─ Fast path: casual /no_think + identity.txt")
+                print(f"  ├─ Casual path: model generate {_gen_ms:.0f}ms, "
+                      f"total {_total_ms:.0f}ms")
                 print(f"  └─ Answer: {(greeting_reply or '')[:80]}...")
             return {
                 "question": question,
@@ -1276,17 +1334,24 @@ class ConfidenceGate:
                 "source": "internal",
                 "sources": [],
                 "sources_used": ["greeting_fast_path"],
-                "reasoning": "casual chat — /no_think with personality guide",
+                "reasoning": f"casual chat — model {_gen_ms:.0f}ms",
                 "timestamp": datetime.now().isoformat(),
                 "tool_context": [],
             }
 
-        # Step 1: Classify the query (use resolved question for better classification)
-        classification = self.classify_query(resolved_question)
+        # Step 1: Lazy confidence — skip the expensive model forward pass
+        # unless we actually need the confidence value for a routing decision.
+        # classify_query() duplicates LIVE_DATA_PATTERNS check already done below
+        # and runs measure_confidence() which is a full 3B model forward pass.
+        _lazy_confidence = None
 
-        if verbose:
-            print(f"  ├─ Confidence: {classification.confidence:.2f}")
-            print(f"  ├─ Reason: {classification.reason}")
+        def _get_confidence():
+            nonlocal _lazy_confidence
+            if _lazy_confidence is None:
+                _lazy_confidence = self.measure_confidence(resolved_question)
+                if verbose:
+                    print(f"  ├─ Confidence: {_lazy_confidence:.2f}")
+            return _lazy_confidence
 
         # Step 1b: Knowledge tree adjustments (blocked content, lessons, corrections)
         adjustments = None
@@ -1298,6 +1363,7 @@ class ConfidenceGate:
             except Exception:
                 pass
 
+        _t_tree_start = _time.time()
         # Step 2: Collect context — DB FIRST, tools ONLY if stale/missing
         # DB is the source of truth for chat. API is only called when DB data
         # is older than the staleness threshold (5min for prices, 30min weather, etc.)
@@ -1369,6 +1435,10 @@ class ConfidenceGate:
             verbose=verbose,
             ngre_brain=self._ngre_brain,
         )
+        _t_tree_ms = (_time.time() - _t_tree_start) * 1000
+        if verbose:
+            print(f"  ├─ Tree search: {_t_tree_ms:.0f}ms "
+                  f"({len(tree_results)} results)")
 
         for r in tree_results:
             content = r.get("content", "")
@@ -1421,20 +1491,21 @@ class ConfidenceGate:
                 need_tool = True
                 if verbose:
                     print(f"  ├─ Tool needed: tree empty, tool available")
-        elif (classification.confidence < TOOL_CONFIDENCE_THRESHOLD
-              and not has_fresh_tree_data):
+        elif (not has_fresh_tree_data
+              and _get_confidence() < TOOL_CONFIDENCE_THRESHOLD):
             # Below 80% confidence + no fresh data — verify with tools
             if executor and executor.detect_intent(resolved_question):
                 need_tool = True
                 if verbose:
-                    print(f"  ├─ Tool needed: confidence {classification.confidence:.0%} "
+                    print(f"  ├─ Tool needed: confidence {_get_confidence():.0%} "
                           f"< {TOOL_CONFIDENCE_THRESHOLD:.0%}, verifying with tool")
 
+        _t_tool_start = _time.time()
         if need_tool:
             # When tool is needed, clear stale tree context — tool data is fresher.
             # Keep graph edge facts (structured, always valid).
             pre_tool_context = list(context_parts)  # backup in case tool fails
-            if classification.confidence < TOOL_CONFIDENCE_THRESHOLD:
+            if _get_confidence() < TOOL_CONFIDENCE_THRESHOLD:
                 # Preserve graph edge facts — drop stale knowledge nodes
                 graph_context = []
                 if graph_has_data and tree_results:
@@ -1448,7 +1519,7 @@ class ConfidenceGate:
                 rag_sources.clear()
 
             # Check if this is an asset query — if so, gather ALL related data in parallel
-            from .asset_context import detect_asset, gather_asset_context
+            from .asset_context import detect_asset, gather_asset_context, _chat_pool
             asset = detect_asset(resolved_question)
 
             # Inject market status note (weekend/holiday awareness)
@@ -1465,10 +1536,12 @@ class ConfidenceGate:
                     pass
 
             if asset and executor:
-                # Parallel: run ALL related tools for this asset type
+                # Parallel: run ALL related tools via DEDICATED chat I/O pool
+                # (never competes with trading, ingestion, or background tasks)
                 asset_results = gather_asset_context(
                     asset, executor,
                     verbose=verbose,
+                    pool=_chat_pool,
                 )
                 for t_name, t_result in asset_results:
                     context_parts.append(t_result)
@@ -1499,6 +1572,9 @@ class ConfidenceGate:
                 context_parts.extend(pre_tool_context)
                 if verbose:
                     print(f"  ├─ Tool returned nothing, restoring tree context")
+        _t_tool_ms = (_time.time() - _t_tool_start) * 1000
+        if verbose and need_tool:
+            print(f"  ├─ Tools: {_t_tool_ms:.0f}ms")
         elif max_age is not None and has_fresh_tree_data:
             if verbose:
                 print(f"  ├─ Tool: skipped (tree has fresh data)")
@@ -1605,7 +1681,13 @@ class ConfidenceGate:
             except Exception:
                 pass
         if self._identity_text:
-            identity += "\n\n" + self._identity_text
+            _id_text = self._identity_text
+            _uname = getattr(self, '_user_name', '')
+            if _uname:
+                _id_text = _id_text.replace('{name}', _uname)
+            else:
+                _id_text = _id_text.replace('{name}', '')
+            identity += "\n\n" + _id_text
         if skill_instructions:
             identity += f"\n\n## Active Skill Instructions\n{skill_instructions}"
 
@@ -1617,6 +1699,7 @@ class ConfidenceGate:
                 chat_turns.append({"role": msg["role"], "content": msg["content"]})
 
         # --- NGRE TreeGate path (when brain is available) ---
+        _t_gen_start = _time.time()
         _ngre_used = False
         routing_level = None
 
@@ -1765,7 +1848,7 @@ class ConfidenceGate:
                 source = "internal"
 
         # Zero hallucination guard — only when NO context and low confidence
-        if answer_text is None or (not context_parts and classification.confidence < self.hallucination_threshold):
+        if answer_text is None or (not context_parts and _get_confidence() < self.hallucination_threshold):
             source = "unknown"
             answer_text = (
                 "I don't have enough information to answer this accurately. "
@@ -1795,7 +1878,12 @@ class ConfidenceGate:
             except Exception:
                 pass  # Hebbian is best-effort, never block answers
 
+        _t_gen_ms = (_time.time() - _t_gen_start) * 1000
+        _t_total_ms = (_time.time() - _t_start) * 1000
         if verbose:
+            print(f"  ├─ Generate: {_t_gen_ms:.0f}ms | "
+                  f"Total: {_t_total_ms:.0f}ms "
+                  f"(tree={_t_tree_ms:.0f} tool={_t_tool_ms:.0f} gen={_t_gen_ms:.0f})")
             print(f"  ├─ Source: {source}")
             print(f"  └─ Answer: {answer_text[:100]}...")
 
@@ -1814,11 +1902,11 @@ class ConfidenceGate:
         result = {
             "question": question,
             "answer": answer_text,
-            "confidence": classification.confidence,
+            "confidence": _lazy_confidence if _lazy_confidence is not None else 0.5,
             "source": source,
             "sources": rag_sources,
             "sources_used": sources_used,
-            "reasoning": classification.reason,
+            "reasoning": f"source={source}",
             "timestamp": datetime.now().isoformat(),
             "tool_context": context_parts[:5] if context_parts else [],
         }

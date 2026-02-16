@@ -1508,30 +1508,35 @@ def tree_search(query: str, graph, user_id: str,
         except Exception:
             pass
 
-    # --- 1. Semantic query — structured edge facts (BFS traversal) ---
-    try:
-        from .confidence import _format_graph_facts
-        sem = graph.semantic_query(query)
-        if sem.get("edge_count", 0) > 0:
-            facts = _format_graph_facts(sem.get("path", []))
-            if facts:
-                results.append({
-                    "content": facts,
-                    "source": "graph",
-                    "score": max(sem.get("confidence", 0.7), 0.7),
-                    "timestamp": "",
-                })
-    except Exception:
-        pass
+    # --- 1 & 2: Semantic query + keyword scan ---
+    # ONLY run these slow O(N) scans when NGRE is unavailable or found nothing.
+    # NGRE embedding search is the primary method (fast HNSW index, semantic).
+    # Keyword scan + semantic_query are legacy fallbacks that do full table scans.
+    _ngre_available = ngre_brain is not None and len(results) > 0
 
-    # --- 2. Knowledge nodes — keyword search on stored content ---
+    if not _ngre_available:
+        # Fallback: semantic_query (BFS edge traversal)
+        try:
+            from .confidence import _format_graph_facts
+            sem = graph.semantic_query(query)
+            if sem.get("edge_count", 0) > 0:
+                facts = _format_graph_facts(sem.get("path", []))
+                if facts:
+                    results.append({
+                        "content": facts,
+                        "source": "graph",
+                        "score": max(sem.get("confidence", 0.7), 0.7),
+                        "timestamp": "",
+                    })
+        except Exception:
+            pass
+
+    # Fallback: keyword scan — only when NGRE unavailable or returned 0 results
     keywords = [w.lower() for w in query.split()
                 if len(w) > 2 and w.lower() not in _TREE_STOP_WORDS]
 
     now_ts = datetime.now()
 
-    # Detect temporal queries: "yesterday", "last week", specific dates
-    # If temporal → we WANT old data, so don't penalize staleness
     _temporal_words = {
         "yesterday", "last", "ago", "previous", "earlier", "before",
         "week", "month", "history", "historical", "past",
@@ -1539,27 +1544,28 @@ def tree_search(query: str, graph, user_id: str,
     query_lower = query.lower()
     is_temporal = any(tw in query_lower for tw in _temporal_words)
 
-    # Resolve temporal date references for matching
-    # "yesterday" → "2026-02-13", "last week" → date range
     target_date = None
     if "yesterday" in query_lower:
         from datetime import timedelta
         target_date = (now_ts - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    if keywords:
-        # Search these node types — all have "content" in properties
+    if keywords and not _ngre_available:
+        if verbose:
+            print(f"  ├─ Keyword scan fallback (NGRE {'no brain' if ngre_brain is None else 'returned 0'})")
+        _KW_SCAN_LIMIT = 200
         _searchable = [
-            ("knowledge", 0.85),       # Tool results stored as nodes
-            ("snapshot", 0.9),         # Ingested time-series (prices, weather, TA)
-            ("event", 0.8),            # Ingested news/articles
-            ("historical_event", 0.8), # Session open/close + significant events
-            ("lesson", 0.9),           # Trade lessons (high value)
-            ("trade_pattern", 0.8),    # Trade patterns
-            ("topic", 0.6),            # Topic nodes (name-based)
+            ("knowledge", 0.85),
+            ("snapshot", 0.9),
+            ("event", 0.8),
+            ("historical_event", 0.8),
+            ("lesson", 0.9),
+            ("trade_pattern", 0.8),
+            ("topic", 0.6),
         ]
         for node_type, type_weight in _searchable:
             try:
-                nodes = graph.list_nodes(node_type=node_type)
+                nodes = graph.list_nodes(node_type=node_type,
+                                         limit=_KW_SCAN_LIMIT)
                 for nid, data in nodes:
                     props = data.get("properties", {})
                     content = props.get("content", "")

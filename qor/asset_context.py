@@ -6,12 +6,17 @@ detect the asset and run ALL related tools in parallel so that
 follow-up questions (indicators, sentiment, news) are instant from cache.
 
 Usage:
-    from qor.asset_context import detect_asset, gather_asset_context
+    from qor.asset_context import detect_asset, gather_asset_context, _chat_pool
 
     asset = detect_asset("What's the price of Bitcoin?")
     # AssetInfo(name='bitcoin', asset_type='crypto', query='bitcoin')
 
-    results = gather_asset_context(asset, executor, cache=cache_store)
+    # Chat path: pass _chat_pool for dedicated chat I/O
+    results = gather_asset_context(asset, executor, pool=_chat_pool)
+    # [(tool_name, result_text), ...]
+
+    # System path (ingestion, background): uses _system_pool by default
+    results = gather_asset_context(asset, executor)
     # [(tool_name, result_text), ...]
 """
 
@@ -22,10 +27,36 @@ from typing import Optional, List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ── Shared worker pool (reused across calls, cheaper on small CPU/GPU) ──
-# Workers are I/O-bound (HTTP calls), so 6 threads is fine even on 1 CPU core.
-_shared_pool = ThreadPoolExecutor(max_workers=12)
-atexit.register(_shared_pool.shutdown, wait=False)
+# ── Two separate pools: chat I/O vs system I/O ──
+# Workers are I/O-bound (HTTP calls), so many threads are fine even on 1 CPU core.
+#
+# _chat_pool  — DEDICATED to chat answer path (gather_asset_context from gate.answer).
+#               Never starved by trading, ingestion, or background tasks.
+# _system_pool — For non-chat callers (ingestion daemon, background analysis, future features).
+#               Chat never competes with these for threads.
+
+_chat_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="qor-chat-io")
+_system_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="qor-sys-io")
+atexit.register(_chat_pool.shutdown, wait=False)
+atexit.register(_system_pool.shutdown, wait=False)
+
+
+def resize_chat_pool(max_workers: int):
+    """Resize the chat I/O pool (called once at startup from config)."""
+    global _chat_pool
+    _chat_pool.shutdown(wait=False)
+    _chat_pool = ThreadPoolExecutor(max_workers=max_workers,
+                                    thread_name_prefix="qor-chat-io")
+    atexit.register(_chat_pool.shutdown, wait=False)
+
+
+def resize_system_pool(max_workers: int):
+    """Resize the system I/O pool (called once at startup from config)."""
+    global _system_pool
+    _system_pool.shutdown(wait=False)
+    _system_pool = ThreadPoolExecutor(max_workers=max_workers,
+                                      thread_name_prefix="qor-sys-io")
+    atexit.register(_system_pool.shutdown, wait=False)
 
 
 @dataclass
@@ -203,6 +234,7 @@ def gather_asset_context(
     cache=None,
     memory=None,
     verbose: bool = True,
+    pool=None,
 ) -> List[Tuple[str, str]]:
     """
     Run all tools for an asset type in parallel.
@@ -213,6 +245,8 @@ def gather_asset_context(
         cache: CacheStore instance (preferred) or None
         memory: MemoryStore instance (fallback) or None
         verbose: Print progress
+        pool: ThreadPoolExecutor to use. If None, uses _system_pool.
+              Chat path should pass _chat_pool for dedicated chat I/O.
 
     Returns:
         List of (tool_name, result_text) for tools that returned data.
@@ -240,11 +274,12 @@ def gather_asset_context(
             pass
         return (tool_name, query, None)
 
-    # Run all tools in parallel via shared pool (reuses threads across calls)
+    # Run all tools in parallel (chat uses _chat_pool, system uses _system_pool)
+    _pool = pool if pool is not None else _system_pool
     futures = []
     for tool_name, query_template in tools:
         query = query_template.format(name=asset.name)
-        futures.append(_shared_pool.submit(_call_one, tool_name, query))
+        futures.append(_pool.submit(_call_one, tool_name, query))
 
     for future in as_completed(futures, timeout=20):
         try:

@@ -1029,6 +1029,12 @@ class QORRuntime:
                 self._shared_cortex.load(cortex_path)
             logger.info("[Runtime] Shared CORTEX analyzer loaded "
                         f"(trained={self._shared_cortex._brain._trained})")
+            # Wire to tools.py for multi_tf_analysis CORTEX output
+            try:
+                from qor.tools import set_shared_cortex
+                set_shared_cortex(self._shared_cortex)
+            except Exception:
+                pass
         except Exception as e:
             logger.debug(f"[Runtime] CORTEX not available: {e}")
 

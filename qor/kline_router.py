@@ -846,6 +846,8 @@ class KlineRouter:
                 except Exception as e:
                     logger.warning(f"[Router] Binance failed for {symbol}: {e}")
             # Fallback to Yahoo
+            logger.warning(f"[Router] FALLBACK: Using Yahoo for {symbol} "
+                           f"(crypto) — data may differ from Binance")
             return self._yahoo.get_klines(
                 symbol, interval=interval, limit=limit,
                 start_time=start_time, end_time=end_time)
@@ -860,6 +862,8 @@ class KlineRouter:
                 except Exception as e:
                     logger.warning(f"[Router] Upstox failed for {symbol}: {e}")
             # Fallback to Yahoo
+            logger.warning(f"[Router] FALLBACK: Using Yahoo for {symbol} "
+                           f"(Indian market) — volume/OI data may be missing")
             return self._yahoo.get_klines(
                 symbol, interval=interval, limit=limit,
                 start_time=start_time, end_time=end_time)
@@ -874,6 +878,9 @@ class KlineRouter:
                 except Exception as e:
                     logger.warning(f"[Router] OANDA failed for {symbol}: {e}")
             # Fallback to Yahoo
+            logger.warning(f"[Router] FALLBACK: Using Yahoo for {symbol} "
+                           f"({asset_type}) — volume=0 for forex, "
+                           f"feature 10 (rel_vol) will be meaningless")
             return self._yahoo.get_klines(
                 symbol, interval=interval, limit=limit,
                 start_time=start_time, end_time=end_time)
@@ -888,6 +895,9 @@ class KlineRouter:
                 except Exception as e:
                     logger.warning(f"[Router] Alpaca failed for {symbol}: {e}")
             # Fallback to Yahoo
+            logger.warning(f"[Router] FALLBACK: Using Yahoo for {symbol} "
+                           f"(stock) — prices are split-adjusted, "
+                           f"intraday data may have gaps")
             return self._yahoo.get_klines(
                 symbol, interval=interval, limit=limit,
                 start_time=start_time, end_time=end_time)

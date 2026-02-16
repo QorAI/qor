@@ -203,6 +203,7 @@ class TradingConfig:
     take_profit_atr_mult: float = 3.0               # TP = entry + N * ATR
     trailing_stop: bool = True                      # Adjust SL as price moves in favor
     min_risk_reward: float = 1.2                    # Minimum R:R ratio to enter
+    slippage_pct: float = 0.05                      # Estimated slippage % (deducted from R:R)
     cooldown_minutes: int = 30                      # Wait after closing a trade
     data_dir: str = "trading"                       # Resolved by resolve_data_paths()
     # DCA (Dollar Cost Average)
@@ -216,9 +217,10 @@ class TradingConfig:
     partial_tp2_pct: float = 100.0                  # Sell remaining at TP2 (100 = close all)
     # Break-even protection
     move_sl_to_be: bool = True                      # Move SL to breakeven after TP1 hit
-    # Trading mode — determines which TF ATR is used for SL/TP/trailing
-    # All modes still use all TFs for trend direction (bias)
-    trade_mode: str = "scalp"                       # "scalp" (5m-30m), "stable" (30m-4h), "secure" (4h-1w)
+    # Trading mode — Elder Triple Screen: trend TF=veto, setup TFs=confluence, entry TF=timing
+    # scalp:  trend=1h, setup=15m+30m, entry=5m | stable: trend=daily, setup=4h, entry=1h
+    # secure: trend=weekly, setup=daily, entry=4h
+    trade_mode: str = "scalp"                       # "scalp", "stable", "secure"
     # Sentiment gates (Polymarket + Fear & Greed + Calendar)
     poly_block_threshold: float = 0.35              # Block entry if Poly against direction (0-1)
     fg_extreme_greed: int = 85                      # Block LONG if F&G > this
@@ -258,6 +260,7 @@ class FuturesConfig:
     take_profit_atr_mult: float = 3.0
     trailing_stop: bool = True
     min_risk_reward: float = 1.2
+    slippage_pct: float = 0.05                  # Estimated slippage % (deducted from R:R)
     cooldown_minutes: int = 30
     data_dir: str = "futures"
     # DCA
@@ -276,9 +279,10 @@ class FuturesConfig:
     funding_rate_threshold: float = 0.03    # Warn if funding > 3%
     max_funding_cost_pct: float = 0.1       # Close if cumulative funding > 0.1% of position
     maintenance_margin_pct: float = 0.006   # Maintenance margin for liq price estimate (0.6%)
-    # Trading mode — determines which TF ATR is used for SL/TP/trailing
-    # All modes still use all TFs for trend direction (bias)
-    trade_mode: str = "scalp"               # "scalp" (5m-30m), "stable" (30m-4h), "secure" (4h-1w)
+    # Trading mode — Elder Triple Screen: trend TF=veto, setup TFs=confluence, entry TF=timing
+    # scalp:  trend=1h, setup=15m+30m, entry=5m | stable: trend=daily, setup=4h, entry=1h
+    # secure: trend=weekly, setup=daily, entry=4h
+    trade_mode: str = "scalp"               # "scalp", "stable", "secure"
     # Sentiment gates (Polymarket + Fear & Greed + Calendar)
     poly_block_threshold: float = 0.35              # Block entry if Poly against direction (0-1)
     fg_extreme_greed: int = 85                      # Block LONG if F&G > this
@@ -540,6 +544,8 @@ class RuntimeConfig:
     enable_ingestion: bool = True             # 24/7 knowledge ingestion daemon (PRD §22) — always on
     query_pool_workers: int = 3              # Concurrent query worker threads (chat queries run in background)
     query_pool_enabled: bool = True          # Enable parallel query pool (False = synchronous fallback)
+    chat_io_workers: int = 10               # Chat-dedicated I/O pool (tool calls from gate.answer)
+    system_io_workers: int = 6              # System I/O pool (ingestion, background tasks — NOT chat)
     # Watched assets — ingestion + session tracker auto-cover these
     # Trading symbols are auto-merged in. Add non-traded assets here.
     # Format: "BTC", "ETH", "AAPL", "gold", "EUR/USD", etc.

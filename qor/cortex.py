@@ -187,6 +187,7 @@ class CortexBrain(nn.Module):
                  observation_dim: int = 32, reflex_neurons: int = 24,
                  reflex_output: int = 8, history_len: int = 500,
                  observation_interval: float = 360.0,
+                 consensus_idx: int = -1,
                  # Backward-compatible aliases
                  mamba_dim: int = None, cfc_neurons: int = None,
                  cfc_output: int = None, mamba_interval: float = None):
@@ -211,6 +212,7 @@ class CortexBrain(nn.Module):
         self.reflex_output = reflex_output
         self.history_len = history_len
         self.observation_interval = observation_interval
+        self.consensus_idx = consensus_idx
 
         # Backward compat aliases
         self.mamba_dim = observation_dim
@@ -235,8 +237,15 @@ class CortexBrain(nn.Module):
         )
 
         # --- R: Reasoning + E: Execution (fusion head) ---
+        # When consensus_idx >= 0, the consensus feature gets a DIRECT bypass
+        # path to the fusion head — it still goes through S4/CfC as normal,
+        # but ALSO feeds directly into the decision layer so it structurally
+        # cannot be diluted by the other features.
+        fusion_input = reflex_output + self.observation_ctx_dim
+        if consensus_idx >= 0:
+            fusion_input += 1  # +1 for direct consensus signal
         self.fusion = nn.Sequential(
-            nn.Linear(reflex_output + self.observation_ctx_dim, 32),
+            nn.Linear(fusion_input, 32),
             nn.GELU(),
             nn.Linear(32, output_size),
         )
@@ -336,6 +345,17 @@ class CortexBrain(nn.Module):
 
         # R+E: Reasoning + Execution — fuse reflex + observation -> final output
         combined = torch.cat([reflex_out, obs_ctx], dim=-1)
+
+        # Consensus bypass: the consensus feature (e.g. TF ratio) feeds
+        # directly into the fusion head as a separate dimension. This ensures
+        # the decision layer ALWAYS sees the consensus signal — it can't be
+        # diluted or ignored by the S4/CfC layers processing 24 features.
+        # The feature ALSO goes through the normal path (S4 → CfC) so
+        # temporal patterns in consensus are still captured.
+        if self.consensus_idx >= 0 and x.shape[-1] > self.consensus_idx:
+            consensus = x[:, self.consensus_idx:self.consensus_idx + 1]
+            combined = torch.cat([combined, consensus], dim=-1)
+
         output = self.fusion(combined)  # (1, output_size)
 
         return output
@@ -425,6 +445,7 @@ class CortexBrain(nn.Module):
                 "reflex_output": self.reflex_output,
                 "history_len": self.history_len,
                 "observation_interval": self.observation_interval,
+                "consensus_idx": self.consensus_idx,
             },
             "trained": self._trained,
             "history": {k: [t.cpu() for t in v] for k, v in self._history.items()},
@@ -448,15 +469,22 @@ class CortexBrain(nn.Module):
             data = torch.load(path, map_location="cpu", weights_only=False)
             saved_cfg = data.get("config", {})
             saved_input = saved_cfg.get("input_size", self.input_size)
+            saved_consensus = saved_cfg.get("consensus_idx", -1)
 
-            if saved_input != self.input_size:
-                # Input size changed (e.g. 20→22 after adding features).
-                # Cannot reuse projection weights — skip them, mark untrained
-                # so bootstrap retrains with new feature dimensions.
+            arch_changed = (saved_input != self.input_size or
+                            saved_consensus != self.consensus_idx)
+            if arch_changed:
+                # Architecture changed — fusion layer size differs.
+                # Load what we can, mark untrained so bootstrap retrains.
+                reasons = []
+                if saved_input != self.input_size:
+                    reasons.append(f"input_size {saved_input}→{self.input_size}")
+                if saved_consensus != self.consensus_idx:
+                    reasons.append(
+                        f"consensus_idx {saved_consensus}→{self.consensus_idx}")
                 logger.info(
-                    "CORTEX input_size changed %d→%d, "
-                    "will retrain with new features",
-                    saved_input, self.input_size)
+                    "CORTEX architecture changed (%s), will retrain",
+                    ", ".join(reasons))
                 self.load_state_dict(data["state_dict"], strict=False)
                 self._trained = False  # Force retrain
             else:
@@ -483,10 +511,10 @@ class CortexBrain(nn.Module):
             "observation_dim": self.observation_dim,
             "input_size": self.input_size,
             "output_size": self.output_size,
+            "consensus_idx": self.consensus_idx,
             "observation_context": self.observation_ctx_dim,
             "history_candles": candle_counts,
             "history_max": self.history_len,
-            "observation_interval_sec (deprecated)": self.observation_interval,
         }
 
 

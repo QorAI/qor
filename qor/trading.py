@@ -103,8 +103,10 @@ class CortexAnalyzer:
     INPUT_SIZE = 24
     OBS_DIM = 32
     REFLEX_NEURONS = 24
+    REFLEX_OUTPUT = 8
     HISTORY_LEN = 500
     OBS_INTERVAL = 360   # 6 min
+    CONSENSUS_IDX = 14   # Feature 14 = TF consensus ratio (direct path to fusion)
 
     def __init__(self):
         if not _HAS_CORTEX:
@@ -113,8 +115,9 @@ class CortexAnalyzer:
         self._brain = CortexBrain(
             input_size=self.INPUT_SIZE, output_size=1,
             observation_dim=self.OBS_DIM, reflex_neurons=self.REFLEX_NEURONS,
-            reflex_output=8, history_len=self.HISTORY_LEN,
+            reflex_output=self.REFLEX_OUTPUT, history_len=self.HISTORY_LEN,
             observation_interval=self.OBS_INTERVAL,
+            consensus_idx=self.CONSENSUS_IDX,
         )
         self._prev = {}  # Per-symbol previous tick for momentum
         self._last_results = {}  # Per-symbol last analyze() result
@@ -1092,6 +1095,9 @@ def parse_analysis(text: str) -> dict:
         "supports": [], "resistances": [],
         "ema21": 0.0, "ema50": 0.0,
         "macd_hist": 0.0, "bb_upper": 0.0, "bb_lower": 0.0,
+        # Per-TF numeric scores (-100..+100)
+        "score_5m": 0, "score_15m": 0, "score_30m": 0,
+        "score_1h": 0, "score_4h": 0, "score_daily": 0, "score_weekly": 0,
         # Per-TF ATR for mode-based SL/TP
         "atr_5m": 0.0, "atr_15m": 0.0, "atr_30m": 0.0,
         "atr_1h": 0.0, "atr_4h": 0.0, "atr_weekly": 0.0,
@@ -1183,17 +1189,21 @@ def parse_analysis(text: str) -> dict:
         if rsi_m:
             result[rsi_key] = float(rsi_m.group(1))
 
-    # Parse per-TF bias from "Score: +15 (BULLISH)" lines
-    for label, bias_key in [
-        ("5-MIN", "bias_5m"), ("15-MIN", "bias_15m"),
-        ("30-MIN", "bias_30m"),
-        ("1-HOUR", "bias_1h"), ("4-HOUR", "bias_4h"),
-        ("DAILY", "bias_daily"), ("WEEKLY", "bias_weekly"),
+    # Parse per-TF bias AND numeric score from "Score: +15 (BULLISH)" lines
+    for label, bias_key, score_key in [
+        ("5-MIN", "bias_5m", "score_5m"),
+        ("15-MIN", "bias_15m", "score_15m"),
+        ("30-MIN", "bias_30m", "score_30m"),
+        ("1-HOUR", "bias_1h", "score_1h"),
+        ("4-HOUR", "bias_4h", "score_4h"),
+        ("DAILY", "bias_daily", "score_daily"),
+        ("WEEKLY", "bias_weekly", "score_weekly"),
     ]:
-        bias_m = re.search(
-            rf'{label}.*?Score:.*?\((\w+)\)', text, re.DOTALL)
-        if bias_m:
-            result[bias_key] = bias_m.group(1).upper()
+        score_m = re.search(
+            rf'{label}.*?Score:\s*([+-]?\d+)\s*\((\w+)\)', text, re.DOTALL)
+        if score_m:
+            result[score_key] = int(score_m.group(1))
+            result[bias_key] = score_m.group(2).upper()
 
     # Parse per-TF divergence from "Divergence: RSI bullish + OBV bullish"
     for label, div_prefix in [
@@ -1273,6 +1283,117 @@ def parse_analysis(text: str) -> dict:
 
 
 # ==============================================================================
+# Elder Triple Screen — Mode-aware TF filtering
+# ==============================================================================
+#
+# Each trade_mode uses 3 screens (Elder's framework, factor of ~4-6x apart):
+#
+#   Mode      Screen 1 (Trend/Veto)   Screen 2 (Setup)   Screen 3 (Entry)
+#   --------  ----------------------  -----------------  -----------------
+#   scalp     1h                      15m, 30m           5m
+#   stable    daily                   4h                 1h
+#   secure    weekly                  daily              4h
+#
+# Rules:
+#   - Screen 1 is a directional VETO — if bearish, no longs (and vice versa)
+#   - Screen 2 TFs determine confluence (bullish_tfs / bearish_tfs count)
+#   - Screen 3 is entry timing only — not counted in confluence
+#   - TFs OUTSIDE the active set are advisory — adjust size, never block
+#
+
+# Mapping: trade_mode -> (trend_tf, setup_tfs, entry_tf, advisory_tfs)
+TRIPLE_SCREEN = {
+    "scalp": {
+        "trend":    ["score_1h"],
+        "setup":    ["score_15m", "score_30m"],
+        "entry":    ["score_5m"],
+        "advisory": ["score_4h", "score_daily", "score_weekly"],
+    },
+    "stable": {
+        "trend":    ["score_daily"],
+        "setup":    ["score_4h"],
+        "entry":    ["score_1h"],
+        "advisory": ["score_5m", "score_15m", "score_30m", "score_weekly"],
+    },
+    "secure": {
+        "trend":    ["score_weekly"],
+        "setup":    ["score_daily"],
+        "entry":    ["score_4h"],
+        "advisory": ["score_5m", "score_15m", "score_30m", "score_1h"],
+    },
+}
+
+
+def recount_confluence(analysis: dict, trade_mode: str = "scalp") -> dict:
+    """Recount bullish/bearish TFs using only mode-relevant screens.
+
+    Modifies analysis dict in-place and returns it.
+
+    Elder Triple Screen logic:
+      - Screen 1 (trend): directional veto stored as 'trend_veto'
+      - Screen 2 (setup): these TFs determine bullish/bearish counts
+      - Screen 3 (entry): not counted, used for timing
+      - Advisory TFs: stored as 'advisory_bias' for size adjustment
+
+    The original all-7-TF counts remain as 'raw_bullish_tfs' / 'raw_bearish_tfs'.
+    """
+    screens = TRIPLE_SCREEN.get(trade_mode, TRIPLE_SCREEN["scalp"])
+
+    # Preserve original counts
+    analysis["raw_bullish_tfs"] = analysis.get("bullish_tfs", 0)
+    analysis["raw_bearish_tfs"] = analysis.get("bearish_tfs", 0)
+    analysis["raw_total_tfs"] = analysis.get("total_tfs", 0)
+
+    # Screen 1: Trend veto
+    # Average of trend TF scores — if bearish, veto longs; if bullish, veto shorts
+    trend_scores = [analysis.get(k, 0) for k in screens["trend"]]
+    trend_avg = sum(trend_scores) / max(len(trend_scores), 1)
+    if trend_avg > 10:
+        analysis["trend_veto"] = "BULLISH"   # veto SHORT entries
+    elif trend_avg < -10:
+        analysis["trend_veto"] = "BEARISH"   # veto LONG entries
+    else:
+        analysis["trend_veto"] = "NEUTRAL"   # no veto
+
+    # Screen 2: Setup TFs — these determine confluence
+    bullish = 0
+    bearish = 0
+    total = 0
+    setup_score = 0
+    for key in screens["setup"]:
+        s = analysis.get(key, 0)
+        setup_score += s
+        total += 1
+        if s > 10:
+            bullish += 1
+        elif s < -10:
+            bearish += 1
+
+    analysis["bullish_tfs"] = bullish
+    analysis["bearish_tfs"] = bearish
+    analysis["total_tfs"] = total
+    analysis["confluence_score"] = setup_score
+
+    # Screen 3: Entry TF — store score for timing decisions
+    entry_scores = [analysis.get(k, 0) for k in screens["entry"]]
+    analysis["entry_tf_score"] = sum(entry_scores) / max(len(entry_scores), 1)
+
+    # Advisory TFs — aggregate for optional size adjustment
+    adv_bullish = 0
+    adv_bearish = 0
+    for key in screens["advisory"]:
+        s = analysis.get(key, 0)
+        if s > 10:
+            adv_bullish += 1
+        elif s < -10:
+            adv_bearish += 1
+    analysis["advisory_bullish"] = adv_bullish
+    analysis["advisory_bearish"] = adv_bearish
+
+    return analysis
+
+
+# ==============================================================================
 # PositionManager — Full AI Decision Engine
 # ==============================================================================
 
@@ -1340,35 +1461,37 @@ class PositionManager:
         return atr
 
     def _get_reversal_threshold(self, total_tfs: int) -> int:
-        """Mode-aware reversal threshold.
+        """Mode-aware reversal threshold (setup TFs only).
 
-        - scalp:  2 TFs (5m-30m flip fast)
-        - stable: 3 TFs (30m-4h)
-        - secure: 4 TFs (4h-1w, high conviction)
+        With Triple Screen, total_tfs is the setup TF count:
+        - scalp:  total=2 → need 2 (both 15m + 30m flip)
+        - stable: total=1 → need 1 (4h flips)
+        - secure: total=1 → need 1 (daily flips)
+
+        Additionally, if the trend TF flips against position, that alone
+        triggers reversal (checked separately via trend_veto).
         """
-        mode = getattr(self.config, "trade_mode", "scalp")
-        if mode == "scalp":
-            return min(2, total_tfs)
-        elif mode == "stable":
-            return min(3, total_tfs)
-        else:
-            return max(4, int(total_tfs * 2 / 3))
+        return max(1, total_tfs)
 
     def _check_scalp_short_tf_reversal(self, analysis: dict) -> tuple:
-        """Check if 2+ of 5m/15m/30m TFs flipped bearish (against LONG).
+        """Check if setup + trend TFs flipped bearish (against LONG position).
+
+        Uses Triple Screen model:
+        - scalp:  checks 15m, 30m (setup) + 1h (trend)
+        - stable: checks 4h (setup) + daily (trend)
+        - secure: checks daily (setup) + weekly (trend)
 
         NOTE: Spot is LONG-only, so this only checks for bearish reversals.
-        The futures version (_check_scalp_short_tf_reversal in FuturesPositionManager)
-        accepts a direction parameter and handles both LONG and SHORT.
         Returns (flipped: bool, count: int, details: str).
         """
         mode = getattr(self.config, "trade_mode", "scalp")
-        if mode != "scalp":
-            return False, 0, ""
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
 
         flipped = 0
         tfs_checked = []
-        for tf_name in ("5m", "15m", "30m"):
+        # Check setup + trend TFs (not entry TF)
+        for score_key in screens["setup"] + screens["trend"]:
+            tf_name = score_key.replace("score_", "")
             bias = analysis.get(f"bias_{tf_name}", "").upper()
             if not bias:
                 continue
@@ -1376,7 +1499,10 @@ class PositionManager:
                 flipped += 1
                 tfs_checked.append(tf_name)
 
-        if flipped >= 2:
+        # Need majority of (setup + trend) to flip
+        total_checked = len(screens["setup"]) + len(screens["trend"])
+        threshold = max(2, (total_checked + 1) // 2)
+        if flipped >= threshold:
             return True, flipped, "+".join(tfs_checked)
         return False, flipped, ""
 
@@ -1394,15 +1520,11 @@ class PositionManager:
         # For LONG: bearish divergence = momentum fading → close
         close_div = "bearish"
 
-        if mode == "scalp":
-            tf_checks = ["5m", "15m", "30m"]
-            min_tfs_matching = 2
-        elif mode == "stable":
-            tf_checks = ["30m", "1h", "4h"]
-            min_tfs_matching = 2
-        else:
-            tf_checks = ["1h", "4h"]
-            min_tfs_matching = 2
+        # Use Triple Screen setup + trend TFs for divergence check
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
+        tf_checks = [k.replace("score_", "") for k in
+                     screens["setup"] + screens["trend"]]
+        min_tfs_matching = max(2, len(tf_checks) // 2)
 
         tfs_with_div = 0
         tfs_with_extreme_rsi = 0
@@ -1466,6 +1588,10 @@ class PositionManager:
                      "reason": "analysis not available"}]
 
         analysis = self._parse_analysis(analysis_text)
+
+        # Elder Triple Screen: recount confluence using only mode-relevant TFs
+        mode = getattr(self.config, "trade_mode", "scalp")
+        recount_confluence(analysis, mode)
 
         # Get current price from exchange
         try:
@@ -1690,19 +1816,20 @@ class PositionManager:
             return actions
 
         # --- 4b. Adverse momentum early exit ---
-        # Checks 5m + 15m + 30m RSI (all scalp TFs)
-        rsi_5m = analysis.get("rsi_5m", 50)
-        rsi_15m = analysis.get("rsi_15m", 50)
-        rsi_30m = analysis.get("rsi_30m", 50)
-        # Close if losing >1% AND any 2 of 3 short TFs show extreme bearish RSI
-        bearish_rsi_count = sum(1 for r in [rsi_5m, rsi_15m, rsi_30m]
-                                if r < 30)
+        # Checks setup + entry TF RSI (mode-aware via Triple Screen)
+        mode = getattr(self.config, "trade_mode", "scalp")
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
+        momentum_tfs = [k.replace("score_", "")
+                        for k in screens["setup"] + screens["entry"]]
+        momentum_rsis = {tf: analysis.get(f"rsi_{tf}", 50)
+                         for tf in momentum_tfs}
+        bearish_rsi_count = sum(1 for r in momentum_rsis.values() if r < 30)
         if pnl_pct < -1.0 and bearish_rsi_count >= 2:
+            rsi_str = " ".join(f"{tf}={v:.0f}" for tf, v in momentum_rsis.items())
             actions.append({
                 "action": "SELL", "symbol": symbol, "trade_id": tid,
                 "exit_status": "closed_momentum",
-                "reason": (f"adverse momentum: RSI 5m={rsi_5m:.0f} "
-                           f"15m={rsi_15m:.0f} 30m={rsi_30m:.0f}, "
+                "reason": (f"adverse momentum: RSI {rsi_str}, "
                            f"P&L {pnl_pct:+.1f}%"),
             })
             return actions
@@ -1870,12 +1997,13 @@ class PositionManager:
         atr = self._get_trade_atr(analysis)
         mode = getattr(self.config, "trade_mode", "scalp")
 
-        # ATR floor: minimum 0.3% of price to prevent unreasonably tight SL/TP
-        if current > 0 and atr > 0:
+        # ATR floor: minimum 0.3% of price — applied ALWAYS (even when ATR=0)
+        # Without this, ATR=0 → SL=0 → unprotected trade
+        if current > 0:
             min_atr = current * 0.003
             if atr < min_atr:
-                logger.debug(f"[PM] ATR floor: {atr:.4f} -> {min_atr:.4f} "
-                             f"(0.3% of ${current:,.2f})")
+                logger.info(f"[PM] ATR floor: {atr:.4f} -> {min_atr:.4f} "
+                            f"(0.3% of ${current:,.2f})")
                 atr = min_atr
 
         # Confluence score strength check — weak signals should not enter
@@ -1944,9 +2072,10 @@ class PositionManager:
                 tp1_price = current + (tp1_price - current) * 0.8
                 tp2_price = current + (tp2_price - current) * 0.8
 
-        # Validate R:R
+        # Validate R:R (subtract estimated slippage from reward)
+        slippage = current * getattr(self.config, "slippage_pct", 0.05) / 100.0
         risk = current - sl_price
-        reward = tp1_price - current
+        reward = tp1_price - current - slippage
         if risk <= 0 or reward <= 0:
             hold["reason"] = "invalid SL/TP levels"
             return [hold]
@@ -2081,6 +2210,16 @@ class PositionManager:
             size_mult *= 0.7
             mult_notes.append(f"HMM(CHOPPY)×0.7")
 
+        # Advisory TFs — higher TFs outside active set slightly reduce size
+        # if they conflict with trade direction (never block, per Elder)
+        adv_against = analysis.get("advisory_bearish", 0)  # Spot = LONG only
+        if adv_against >= 2:
+            size_mult *= 0.8
+            mult_notes.append(f"advisory({adv_against}contra)×0.8")
+        elif adv_against >= 1:
+            size_mult *= 0.9
+            mult_notes.append(f"advisory({adv_against}contra)×0.9")
+
         # ============================================================
         # Compute Kelly position size WITH all signal multipliers
         # This IS the decision — size is known at decision time
@@ -2171,11 +2310,18 @@ class PositionManager:
         if open_count >= self.config.max_open_positions:
             return f"max positions reached ({open_count}/{self.config.max_open_positions})"
 
-        # Multi-TF confluence: need >= 3 TFs bullish (or >50%)
+        # Elder Triple Screen veto: trend TF blocks LONG if bearish
+        # (Spot is LONG-only, so bearish trend = no entry)
+        trend_veto = analysis.get("trend_veto", "NEUTRAL")
+        if trend_veto == "BEARISH":
+            return f"trend TF veto: {trend_veto} (no longs against trend)"
+
+        # Setup TF confluence: majority of setup TFs must be bullish
         if analysis["total_tfs"] > 0:
-            min_bullish = max(3, analysis["total_tfs"] // 2 + 1)
+            min_bullish = max(1, (analysis["total_tfs"] + 1) // 2)  # majority
             if analysis["bullish_tfs"] < min_bullish:
-                return f"weak confluence: {analysis['bullish_tfs']}/{analysis['total_tfs']} bullish (need {min_bullish})"
+                return (f"weak confluence: {analysis['bullish_tfs']}/{analysis['total_tfs']} "
+                        f"setup TFs bullish (need {min_bullish})")
 
         # Quant edge validation — replaces simple win-rate check
         # Uses Expectancy + Risk of Ruin from qor.quant
@@ -2230,7 +2376,8 @@ class PositionManager:
                 bench = analysis.get("price_returns", [])
                 if bench and len(returns) >= 10:
                     n = min(len(returns), len(bench))
-                    analysis["quant_alpha"] = qm.capm_alpha(returns[:n], bench[:n])
+                    capm = qm.capm_alpha(returns[:n], bench[:n])
+                    analysis["quant_alpha"] = capm["alpha"]
                     analysis["quant_ir"] = qm.information_ratio(returns[:n], bench[:n])
             except Exception:
                 pass
@@ -2410,9 +2557,26 @@ class TradingEngine:
         }
         self._activity_log.append(entry)
 
+    def _warm_hmm(self):
+        """Pre-warm HMM with historical klines to skip the 2.5h cold start."""
+        if not self.hmm or not self.hmm.is_available:
+            return
+        for symbol in self.config.symbols:
+            # Skip if already warmed (e.g. shared HMM from futures engine)
+            history = self.hmm._obs_history.get(symbol, [])
+            if len(history) >= self.hmm.MIN_HISTORY:
+                continue
+            pair = self.client.format_pair(symbol)
+            try:
+                klines = self.client.get_klines(pair, interval="5m", limit=50)
+                self.hmm.warm_from_klines(klines, symbol=symbol)
+            except Exception as e:
+                logger.warning(f"[Trading] HMM warm-up failed for {symbol}: {e}")
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        self._warm_hmm()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="qor-trading")
@@ -2578,8 +2742,12 @@ class TradingEngine:
                     if decision.get("cortex_label"):
                         cortex_info = (f" [CORTEX:{decision['cortex_label']} "
                                        f"{decision.get('cortex_signal', 0):.2f}]")
-                    logger.info(f"[Trading] {symbol}: {action} — {reason}{cortex_info}")
-                    self._log_activity(symbol, action, f"{reason}{cortex_info}")
+                    # Show WAIT instead of HOLD when there's no position
+                    display_action = action
+                    if action == "HOLD" and not has_balance:
+                        display_action = "WAIT"
+                    logger.info(f"[Trading] {symbol}: {display_action} — {reason}{cortex_info}")
+                    self._log_activity(symbol, display_action, f"{reason}{cortex_info}")
 
                     if action == "BUY":
                         self._execute_buy(symbol, decision)
@@ -2639,15 +2807,22 @@ class TradingEngine:
             logger.error(f"[Trading] Cannot get price for {pair}: {e}")
             return
         if price <= 0:
+            logger.warning(f"[Trading] BUY {pair}: price is {price}, skipping")
             return
 
-        quantity = self.client.round_qty(pair, position_usdt / price)
+        raw_qty = position_usdt / price
+        quantity = self.client.round_qty(pair, raw_qty)
         try:
             lot = self.client.get_lot_size(pair)
             if quantity < lot["minQty"]:
+                logger.warning(
+                    f"[Trading] BUY {pair}: qty {quantity:.8f} < minQty "
+                    f"{lot['minQty']:.8f} (usdt=${position_usdt:.2f}, "
+                    f"price=${price:,.2f}, available=${available:.2f}, "
+                    f"pct={position_pct:.1f}%)")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Trading] Lot size fetch failed for {pair}: {e}")
 
         try:
             order = self.client.place_order(pair, "BUY", quantity)

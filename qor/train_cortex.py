@@ -1,25 +1,37 @@
 """
 QOR CORTEX Trainer — Historical Data → Brain Training Pipeline
 ================================================================
-Fetches historical OHLCV candles from exchanges, computes all 20
+Fetches historical OHLCV candles from exchanges, computes all 24
 technical indicators matching CortexAnalyzer._build_features(),
 labels each candle with future return, and trains CORTEX brain.
 
 Pipeline:
-  1. Fetch klines (1h candles, 90 days default)
-  2. Compute indicators: RSI, EMA, MACD, BB, ATR, OBV, VWAP, ADX, Keltner
-  3. Build 22-dim feature vectors (same as live _build_features)
-  4. Label with lookahead return: +1 (bullish), -1 (bearish), 0 (neutral)
-  5. Train CortexAnalyzer.train_batch()
+  1. Fetch klines (interval/days auto-set per trade mode)
+  2. Fetch historical Fear & Greed + funding rates (features 15, 21)
+  3. Compute indicators: RSI, EMA, MACD, BB, ATR, OBV, VWAP, ADX, Keltner
+  4. Compute multi-TF confluence via aggregated higher timeframes (feature 14)
+  5. Compute OI proxy from daily volume ratio (feature 16)
+  6. Compute rolling Volume Profile VRVP (features 22-23)
+  7. Build 24-dim feature vectors (same as live _build_features)
+  8. Label with lookahead return (mode-aware lookahead)
+  9. Train per-symbol sequentially (preserves CfC temporal context)
+  10. Fine-tune on shuffled mixed data (generalization)
+
+Feature coverage: 24/24 features have real or proxy data during training.
+Feature 20 (Polymarket) uses momentum-sentiment proxy (no historical API).
+
+Mode-aware defaults:
+  scalp:  5m candles, 30 days, lookahead=12 (1 hour)
+  stable: 1h candles, 90 days, lookahead=12 (12 hours) — default
+  secure: 4h candles, 180 days, lookahead=12 (48 hours)
 
 Usage:
     from qor.train_cortex import CortexTrainer
     trainer = CortexTrainer(client, cortex_analyzer)
-    result = trainer.train("BTC", days=90, epochs=20)
-    # result = {"trained": True, "samples": 2100, "loss": 0.023, ...}
+    result = trainer.train("BTC", mode="scalp", epochs=20)
 
-    # Or train all configured symbols:
-    results = trainer.train_all(["BTC", "ETH", "SOL"], days=90)
+    # Or train all configured symbols with mode:
+    results = trainer.train_all(["BTC", "ETH", "SOL"], mode="stable")
 """
 
 import logging
@@ -307,6 +319,145 @@ def _lower_wick_ratio(opens: list, highs: list, lows: list,
 
 
 # =============================================================================
+# Multi-Timeframe Aggregation & Scoring
+# =============================================================================
+
+def _aggregate_candles(opens: list, highs: list, lows: list,
+                       closes: list, volumes: list, factor: int):
+    """Aggregate OHLCV candles into a higher timeframe.
+
+    Groups every `factor` candles into one (e.g., factor=4 turns 1h -> 4h).
+    Returns (agg_opens, agg_highs, agg_lows, agg_closes, agg_volumes).
+    """
+    n = len(closes)
+    ao, ah, al, ac, av = [], [], [], [], []
+    for s in range(0, n - factor + 1, factor):
+        e = s + factor
+        ao.append(opens[s])
+        ah.append(max(highs[s:e]))
+        al.append(min(lows[s:e]))
+        ac.append(closes[e - 1])
+        av.append(sum(volumes[s:e]))
+    return ao, ah, al, ac, av
+
+
+def _score_tf_point(close: float, rsi: float, ema21: float,
+                    ema50: float, macd_hist: float):
+    """Score a single timeframe at one point in time.
+
+    Matches live multi-TF scoring logic (RSI, EMA alignment, MACD).
+    Returns score (-100 to +100), or None if indicators not ready.
+    """
+    if close <= 0:
+        return None
+    if ema21 <= 0 and ema50 <= 0:
+        return None
+    score = 0
+    if rsi > 55:
+        score += 20
+    elif rsi < 45:
+        score -= 20
+    if ema21 > 0:
+        if close > ema21 * 1.001:
+            score += 20
+        elif close < ema21 * 0.999:
+            score -= 20
+    if ema50 > 0:
+        if close > ema50 * 1.001:
+            score += 20
+        elif close < ema50 * 0.999:
+            score -= 20
+    if macd_hist > 0:
+        score += 20
+    elif macd_hist < 0:
+        score -= 20
+    if ema21 > 0 and ema50 > 0:
+        if ema21 > ema50:
+            score += 20
+        elif ema21 < ema50:
+            score -= 20
+    return max(-100, min(100, score))
+
+
+# =============================================================================
+# Volume Profile (VRVP — Volume Range Visible Profile)
+# =============================================================================
+
+def _compute_vp(highs: list, lows: list, closes: list,
+                volumes: list, start: int, end: int,
+                num_bins: int = 50):
+    """Compute volume profile (VRVP) for a window of candles.
+
+    Distributes volume across price bins, finds POC, Value Area, HVN/LVN.
+    Returns (poc, vah, val, hvn_list, lvn_list) or None.
+    """
+    if end <= start or end > len(closes) or (end - start) < 20:
+        return None
+
+    h_s = highs[start:end]
+    l_s = lows[start:end]
+    v_s = volumes[start:end]
+
+    price_min = min(l_s)
+    price_max = max(h_s)
+    if price_max <= price_min:
+        return None
+
+    bin_size = (price_max - price_min) / num_bins
+    if bin_size <= 0:
+        return None
+
+    vol_bins = [0.0] * num_bins
+    bin_prices = [price_min + (b + 0.5) * bin_size for b in range(num_bins)]
+
+    for k in range(len(v_s)):
+        h, low, v = h_s[k], l_s[k], v_s[k]
+        if v <= 0 or h <= low:
+            continue
+        lo_bin = max(0, int((low - price_min) / bin_size))
+        hi_bin = min(num_bins - 1, int((h - price_min) / bin_size))
+        n_bins = hi_bin - lo_bin + 1
+        vpb = v / n_bins if n_bins > 0 else 0
+        for b in range(lo_bin, hi_bin + 1):
+            vol_bins[b] += vpb
+
+    total_vol = sum(vol_bins)
+    if total_vol <= 0:
+        return None
+
+    poc_bin = vol_bins.index(max(vol_bins))
+    poc = bin_prices[poc_bin]
+
+    # Value Area — 70% of volume expanding from POC
+    target = total_vol * 0.7
+    va_vol = vol_bins[poc_bin]
+    lo_va, hi_va = poc_bin, poc_bin
+    while va_vol < target and (lo_va > 0 or hi_va < num_bins - 1):
+        lo_v = vol_bins[lo_va - 1] if lo_va > 0 else 0
+        hi_v = vol_bins[hi_va + 1] if hi_va < num_bins - 1 else 0
+        if lo_v >= hi_v and lo_va > 0:
+            lo_va -= 1
+            va_vol += lo_v
+        elif hi_va < num_bins - 1:
+            hi_va += 1
+            va_vol += hi_v
+        else:
+            break
+
+    vah = bin_prices[hi_va] + bin_size / 2
+    val_price = bin_prices[lo_va] - bin_size / 2
+
+    avg_v = total_vol / num_bins
+    std_v = (sum((x - avg_v) ** 2 for x in vol_bins) / num_bins) ** 0.5
+    hvns = [bin_prices[b] for b in range(num_bins)
+            if vol_bins[b] > avg_v + 0.5 * std_v][:10]
+    lvns = [bin_prices[b] for b in range(num_bins)
+            if 0 < vol_bins[b] < avg_v - 0.5 * std_v][:10]
+
+    return (poc, vah, val_price, hvns, lvns)
+
+
+# =============================================================================
 # Candle data container
 # =============================================================================
 
@@ -336,12 +487,47 @@ class Candles:
             self.volumes.append(float(k[5]))
 
         self._indicators = {}
+        self._funding_cache = []   # [(timestamp_ms, rate), ...] sorted
+        self._fg_cache = []        # [(timestamp_ms, value_0_to_1), ...] sorted
+        self._base_interval = "1h"
 
     def __len__(self):
         return len(self.closes)
 
-    def compute_all(self):
-        """Compute all indicators needed for the 20-dim CORTEX vector."""
+    def _get_nearest_funding(self, ts_ms: int) -> float:
+        """Find nearest funding rate for a timestamp. Returns scaled (-1, 1)."""
+        if not self._funding_cache:
+            return 0.0
+        best = 0.0
+        best_dist = float("inf")
+        for fts, rate in self._funding_cache:
+            dist = abs(fts - ts_ms)
+            if dist < best_dist:
+                best_dist = dist
+                best = rate
+        # Scale: 0.01% funding → 1.0 (same as live _build_features)
+        return max(-1.0, min(1.0, best * 100))
+
+    def _get_nearest_fg(self, ts_ms: int) -> float:
+        """Find nearest Fear & Greed value for a timestamp. Returns 0-1."""
+        if not self._fg_cache:
+            return 0.5
+        best = 0.5
+        best_dist = float("inf")
+        for fts, val in self._fg_cache:
+            dist = abs(fts - ts_ms)
+            if dist < best_dist:
+                best_dist = dist
+                best = val
+        return best
+
+    def compute_all(self, base_interval: str = "1h"):
+        """Compute all indicators needed for the 24-dim CORTEX vector.
+
+        Args:
+            base_interval: Candle interval for multi-TF aggregation factors.
+        """
+        self._base_interval = base_interval
         c = self.closes
         h = self.highs
         l = self.lows
@@ -374,16 +560,175 @@ class Candles:
         self._indicators["upper_wick"] = _upper_wick_ratio(o, h, l, c)
         self._indicators["lower_wick"] = _lower_wick_ratio(o, h, l, c)
 
+        # Multi-TF confluence (replaces EMA proxy for feature 14)
+        self._compute_multi_tf()
+
+        # OI proxy from volume ratio (feature 16)
+        self._compute_oi_proxy()
+
+        # Volume Profile rolling (features 22-23)
+        self._compute_volume_profile_rolling()
+
         return self
+
+    def _compute_multi_tf(self):
+        """Compute multi-TF confluence scores for feature 14.
+
+        Aggregates base candles into 3-4 higher timeframes, computes
+        RSI + EMA + MACD for each, scores as bullish/bearish/neutral.
+        Stores per-candle bullish/total counts in indicators.
+        """
+        FACTOR_MAP = {
+            "1m": [5, 15, 60, 240],
+            "5m": [3, 12, 48],
+            "15m": [4, 16, 96],
+            "30m": [2, 8, 48],
+            "1h": [4, 24, 168],
+            "4h": [6, 42],
+            "1d": [7],
+        }
+        factors = FACTOR_MAP.get(self._base_interval, [4, 24])
+        n = len(self.closes)
+
+        # Pre-compute scores for each TF
+        tf_data = []  # list of (factor, scores_list)
+
+        # Base TF scores (already have indicators)
+        base_rsi = self._indicators.get("rsi14", [50.0] * n)
+        base_ema21 = self._indicators.get("ema21", [0.0] * n)
+        base_ema50 = self._indicators.get("ema50", [0.0] * n)
+        base_macd = self._indicators.get("macd_hist", [0.0] * n)
+        base_scores = []
+        for i in range(n):
+            s = _score_tf_point(self.closes[i], base_rsi[i],
+                                base_ema21[i], base_ema50[i], base_macd[i])
+            base_scores.append(s)
+        tf_data.append((1, base_scores))
+
+        # Aggregated TF scores
+        for factor in factors:
+            if n < factor * 30:
+                continue
+            agg_o, agg_h, agg_l, agg_c, agg_v = _aggregate_candles(
+                self.opens, self.highs, self.lows,
+                self.closes, self.volumes, factor)
+            agg_n = len(agg_c)
+            if agg_n < 21:
+                continue
+            agg_rsi = _rsi(agg_c, 14)
+            agg_ema21 = _ema(agg_c, 21)
+            agg_ema50 = _ema(agg_c, 50)
+            _, _, agg_macd_hist = _macd(agg_c)
+            agg_scores = []
+            for j in range(agg_n):
+                s = _score_tf_point(agg_c[j], agg_rsi[j], agg_ema21[j],
+                                    agg_ema50[j], agg_macd_hist[j])
+                agg_scores.append(s)
+            tf_data.append((factor, agg_scores))
+
+        # Build per-base-candle multi-TF counts
+        mtf_bullish = [0] * n
+        mtf_total = [1] * n  # at least base TF
+
+        for i in range(n):
+            bullish = 0
+            total = 0
+            for factor, scores in tf_data:
+                agg_idx = i // factor if factor > 1 else i
+                if agg_idx >= len(scores):
+                    agg_idx = len(scores) - 1
+                s = scores[agg_idx]
+                if s is None:
+                    continue
+                total += 1
+                if s > 10:
+                    bullish += 1
+            mtf_bullish[i] = bullish
+            mtf_total[i] = max(total, 1)
+
+        self._indicators["mtf_bullish"] = mtf_bullish
+        self._indicators["mtf_total"] = mtf_total
+
+    def _compute_oi_proxy(self):
+        """Compute OI change proxy from daily volume ratio for feature 16.
+
+        Live uses (vol_today - vol_yesterday) / vol_yesterday from daily klines.
+        Training replicates this from available OHLCV volumes.
+        """
+        DAY_CANDLES = {
+            "1m": 1440, "5m": 288, "15m": 96, "30m": 48,
+            "1h": 24, "4h": 6, "1d": 1,
+        }
+        dc = DAY_CANDLES.get(self._base_interval, 24)
+        n = len(self.volumes)
+        oi_proxy = [0.0] * n
+
+        for i in range(dc * 2, n):
+            vol_today = sum(self.volumes[i - dc:i])
+            vol_yesterday = sum(self.volumes[i - dc * 2:i - dc])
+            if vol_yesterday > 0:
+                ratio = (vol_today - vol_yesterday) / vol_yesterday
+                oi_proxy[i] = max(-0.5, min(0.5, ratio))
+
+        self._indicators["oi_proxy"] = oi_proxy
+
+    def _compute_volume_profile_rolling(self, lookback: int = 200,
+                                         step: int = 100):
+        """Compute rolling volume profile for features 22-23.
+
+        Recomputes VP every `step` candles using a `lookback` window.
+        Stores per-candle VP POC position and density values.
+        """
+        n = len(self.closes)
+        vp_poc_pos = [0.5] * n
+        vp_density = [0.5] * n
+
+        last_vp = None
+
+        for i in range(lookback, n):
+            if (i - lookback) % step == 0 or last_vp is None:
+                start = max(0, i - lookback)
+                vp = _compute_vp(self.highs, self.lows, self.closes,
+                                 self.volumes, start, i + 1, num_bins=50)
+                if vp is not None:
+                    last_vp = vp
+
+            if last_vp is None:
+                continue
+
+            poc, vah, val, hvns, lvns = last_vp
+            c = self.closes[i]
+
+            # Feature 22: VP POC position
+            va_range = vah - val
+            if va_range > 0:
+                vp_poc_pos[i] = max(0.0, min(1.0, (c - val) / va_range))
+
+            # Feature 23: VP density
+            threshold = c * 0.005
+            near_hvn = any(abs(c - h) < threshold for h in hvns) if hvns else False
+            near_lvn = any(abs(c - lv) < threshold for lv in lvns) if lvns else False
+            if near_hvn and not near_lvn:
+                vp_density[i] = 1.0
+            elif near_lvn and not near_hvn:
+                vp_density[i] = 0.0
+
+        self._indicators["vp_poc_pos"] = vp_poc_pos
+        self._indicators["vp_density"] = vp_density
 
     def get_feature_vector(self, i: int) -> Optional[list]:
         """Build the 24-dim feature vector for candle index i.
 
         Matches CortexAnalyzer._build_features() normalization exactly.
-        Features 20-21 (Polymarket, Fear&Greed) default to 0.5 (neutral)
-        since no historical data is available for these.
-        Features 22-23 (VP POC position, VP density) default to 0.5 (neutral)
-        since no historical volume profile data is available.
+        All 24 features now have real data during training:
+          0-13: TA indicators (RSI, EMA, MACD, BB, ATR, etc.)
+          14: Multi-TF confluence (aggregated higher-TF scoring)
+          15: Funding rate (from historical Binance API if available)
+          16: OI change proxy (daily volume ratio from OHLCV)
+          17-19: Candlestick shape (body ratio, wick ratios)
+          20: Polymarket sentiment proxy (momentum-based — no historical API)
+          21: Fear & Greed (from historical alternative.me API if available)
+          22-23: Volume Profile (rolling VRVP from OHLCV data)
 
         Returns None if indicators aren't ready (warmup period).
         """
@@ -450,22 +795,21 @@ class Candles:
         # 13: ADX normalized (0-1, 100 max)
         f_adx = min(ind["adx"][i] / 100.0, 1.0)
 
-        # 14: TF confluence ratio — from candle trend direction
-        # Use multi-EMA alignment as proxy for TF confluence
-        above_ema21 = 1 if c > ema21 else 0
-        above_ema50 = 1 if c > ema50 else 0
-        above_ema200 = 1 if c > ema200 else 0
-        ema21_above_50 = 1 if ema21 > ema50 else 0
-        ema50_above_200 = 1 if ema50 > ema200 else 0
-        macd_positive = 1 if macd_hist > 0 else 0
-        f_tf = (above_ema21 + above_ema50 + above_ema200 +
-                ema21_above_50 + ema50_above_200 + macd_positive) / 6.0
+        # 14: TF confluence ratio — real multi-TF scoring
+        # Uses aggregated higher-TF RSI/EMA/MACD scoring (matches live)
+        mtf_bull = ind.get("mtf_bullish", [0] * len(self.closes))
+        mtf_tot = ind.get("mtf_total", [1] * len(self.closes))
+        f_tf = mtf_bull[i] / max(mtf_tot[i], 1)
 
-        # 15: Funding rate (0 for spot/historical — no funding data)
+        # 15: Funding rate (from historical data if available)
         f_funding = 0.0
+        if hasattr(self, '_funding_cache') and self._funding_cache:
+            ts = self.timestamps[i]
+            f_funding = self._get_nearest_funding(ts)
 
-        # 16: OI change (0 for spot/historical — no OI data)
-        f_oi = 0.0
+        # 16: OI change proxy — daily volume ratio (matches live computation)
+        oi_val = ind.get("oi_proxy", [0.0] * len(self.closes))[i]
+        f_oi = max(-1.0, min(1.0, oi_val * 10))
 
         # 17: Candlestick body/range ratio (0-1)
         f_body = max(0.0, min(1.0, ind["body_ratio"][i]))
@@ -476,17 +820,32 @@ class Candles:
         # 19: Lower wick ratio (0-1)
         f_lwk = max(0.0, min(1.0, ind["lower_wick"][i]))
 
-        # 20: Polymarket sentiment (neutral default — no historical data)
-        f_poly = 0.5
+        # 20: Polymarket sentiment proxy — momentum-based (no historical API)
+        # Polymarket crypto up/down markets follow momentum closely, so
+        # RSI + EMA trend serves as a correlated proxy during training.
+        # This prevents CORTEX from learning zero-weight on this dimension.
+        rsi_norm = ind["rsi14"][i] / 100.0
+        ema21_v = ind["ema21"][i] or c
+        ema50_v = ind["ema50"][i] or c
+        if c > ema21_v and ema21_v > ema50_v:
+            ema_sig = 0.65
+        elif c < ema21_v and ema21_v < ema50_v:
+            ema_sig = 0.35
+        else:
+            ema_sig = 0.5
+        f_poly = max(0.0, min(1.0, 0.3 * rsi_norm + 0.7 * ema_sig))
 
-        # 21: Fear & Greed index (neutral default — no historical data)
+        # 21: Fear & Greed index (from historical data if available)
         f_fg = 0.5
+        if hasattr(self, '_fg_cache') and self._fg_cache:
+            ts = self.timestamps[i]
+            f_fg = self._get_nearest_fg(ts)
 
-        # 22: VP POC position (neutral default — no historical VP data)
-        f_vp_pos = 0.5
+        # 22: VP POC position — from rolling volume profile
+        f_vp_pos = ind.get("vp_poc_pos", [0.5] * len(self.closes))[i]
 
-        # 23: VP density (neutral default — no historical VP data)
-        f_vp_dens = 0.5
+        # 23: VP density — from rolling volume profile (HVN/LVN proximity)
+        f_vp_dens = ind.get("vp_density", [0.5] * len(self.closes))[i]
 
         return [
             f_rsi14, f_rsi6, f_rsi_mom, f_ema21, f_ema50, f_ema200,
@@ -620,6 +979,68 @@ class CortexTrainer:
         self.client = client
         self.cortex = cortex
 
+    # Mode-aware defaults for interval and lookahead
+    MODE_DEFAULTS = {
+        "scalp":  {"interval": "5m",  "lookahead": 12, "days": 30},
+        "stable": {"interval": "1h",  "lookahead": 12, "days": 90},
+        "secure": {"interval": "4h",  "lookahead": 12, "days": 180},
+    }
+
+    def _fetch_historical_fg(self) -> list:
+        """Fetch historical Fear & Greed index from alternative.me (free API).
+
+        Returns: [(timestamp_ms, value_0_to_1), ...]
+        """
+        import urllib.request
+        import json
+        url = "https://api.alternative.me/fng/?limit=0&format=json"
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "QOR-Trainer/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            result = []
+            for entry in data.get("data", []):
+                ts_ms = int(entry["timestamp"]) * 1000
+                val = int(entry["value"]) / 100.0  # 0-100 → 0-1
+                result.append((ts_ms, val))
+            result.sort(key=lambda x: x[0])
+            logger.info(f"[CortexTrainer] Fetched {len(result)} historical "
+                        f"Fear & Greed entries")
+            return result
+        except Exception as e:
+            logger.warning(f"[CortexTrainer] Historical F&G fetch failed: {e}")
+            return []
+
+    def _fetch_historical_funding(self, symbol: str) -> list:
+        """Fetch historical funding rates from Binance futures API.
+
+        Returns: [(timestamp_ms, rate_float), ...]
+        """
+        import urllib.request
+        import json
+        pair = symbol.upper() + "USDT"
+        url = (f"https://fapi.binance.com/fapi/v1/fundingRate"
+               f"?symbol={pair}&limit=1000")
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "QOR-Trainer/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            result = []
+            for entry in data:
+                ts_ms = int(entry["fundingTime"])
+                rate = float(entry["fundingRate"])
+                result.append((ts_ms, rate))
+            result.sort(key=lambda x: x[0])
+            logger.info(f"[CortexTrainer] Fetched {len(result)} historical "
+                        f"funding rates for {pair}")
+            return result
+        except Exception as e:
+            logger.warning(f"[CortexTrainer] Historical funding fetch "
+                           f"failed for {pair}: {e}")
+            return []
+
     def fetch(self, symbol: str, days: int = 90,
               interval: str = "1h") -> Candles:
         """Fetch historical klines and compute all indicators.
@@ -721,7 +1142,25 @@ class CortexTrainer:
                      f"for {symbol}")
 
         candles = Candles(all_klines)
-        candles.compute_all()
+        candles.compute_all(base_interval=interval)
+
+        # Enrich with historical Fear & Greed + funding rates
+        # (features 15, 21 — otherwise constant 0/0.5 during training)
+        try:
+            if not hasattr(self, '_fg_data'):
+                self._fg_data = self._fetch_historical_fg()
+            candles._fg_cache = self._fg_data
+        except Exception:
+            pass
+        try:
+            sym_upper = symbol.upper()
+            cache_key = f"_funding_{sym_upper}"
+            if not hasattr(self, cache_key):
+                setattr(self, cache_key, self._fetch_historical_funding(symbol))
+            candles._funding_cache = getattr(self, cache_key)
+        except Exception:
+            pass
+
         return candles
 
     def prepare(self, candles: Candles, lookahead: int = 12,
@@ -808,7 +1247,8 @@ class CortexTrainer:
     def train(self, symbol: str, days: int = 90, interval: str = "1h",
               lookahead: int = 12, threshold_pct: float = 1.0,
               label_mode: str = "continuous",
-              epochs: int = 20, lr: float = 1e-3) -> dict:
+              epochs: int = 20, lr: float = 1e-3,
+              mode: str = "") -> dict:
         """Full pipeline: fetch → compute → label → train.
 
         Args:
@@ -820,12 +1260,20 @@ class CortexTrainer:
             label_mode: "continuous" or "categorical"
             epochs: Training epochs
             lr: Learning rate
+            mode: Trade mode ("scalp", "stable", "secure") for auto-defaults
 
         Returns:
             {"trained": bool, "symbol": str, "samples": int,
              "candles_fetched": int, ...}
         """
         t0 = time.time()
+
+        # Mode-aware defaults
+        if mode and mode in self.MODE_DEFAULTS:
+            md = self.MODE_DEFAULTS[mode]
+            interval = md["interval"]
+            days = md["days"]
+            lookahead = md["lookahead"]
 
         # 1. Fetch
         candles = self.fetch(symbol, days=days, interval=interval)
@@ -858,27 +1306,44 @@ class CortexTrainer:
 
     def train_all(self, symbols: list, days: int = 90,
                   interval: str = "1h", epochs: int = 20,
-                  **kwargs) -> dict:
-        """Train CORTEX on multiple symbols (pooled data).
+                  mode: str = "", **kwargs) -> dict:
+        """Train CORTEX on multiple symbols — per-symbol sequential + mixed.
 
-        Fetches history for all symbols, pools features + targets,
-        then trains once on the combined dataset. This gives CORTEX
-        a broader view of market patterns across assets.
+        Phase 1: Train each symbol sequentially (preserves CfC temporal context).
+        Phase 2: Fine-tune on shuffled mixed data (generalization).
+
+        This fixes the issue where shuffled multi-symbol data destroys
+        temporal coherence in the S4 observation layer and CfC hidden states.
 
         Args:
             symbols: List of symbols ["BTC", "ETH", "SOL"]
-            days: Days of history per symbol
-            interval: Candle interval
-            epochs: Training epochs
+            days: Days of history per symbol (overridden by mode defaults)
+            interval: Candle interval (overridden by mode defaults)
+            epochs: Training epochs (split: 60% sequential, 40% mixed)
+            mode: Trade mode ("scalp", "stable", "secure") for auto-defaults
             **kwargs: Passed to prepare()
 
         Returns:
             {"trained": bool, "symbols": [...], "total_samples": int, ...}
         """
         t0 = time.time()
+
+        # Mode-aware defaults override explicit params if mode is set
+        if mode and mode in self.MODE_DEFAULTS:
+            md = self.MODE_DEFAULTS[mode]
+            interval = md["interval"]
+            days = md["days"]
+            kwargs.setdefault("lookahead", md["lookahead"])
+            logger.info(f"[CortexTrainer] Mode '{mode}': interval={interval}, "
+                        f"days={days}, lookahead={md['lookahead']}")
+
+        per_symbol = {}
         all_features = []
         all_targets = []
-        per_symbol = {}
+
+        # Phase 1: Per-symbol sequential training (temporal patterns)
+        seq_epochs = max(epochs * 3 // 5, 1)  # 60% of epochs
+        mix_epochs = max(epochs - seq_epochs, 1)  # 40% of epochs
 
         for symbol in symbols:
             try:
@@ -888,9 +1353,13 @@ class CortexTrainer:
                     "candles": len(candles),
                     "samples": len(features),
                 }
-                all_features.extend(features)
-                all_targets.extend(targets)
-                logger.info(f"[CortexTrainer] {symbol}: {len(features)} samples")
+                if features:
+                    # Train sequentially — CfC hidden state carries context
+                    logger.info(f"[CortexTrainer] Phase 1: {symbol} sequential "
+                                f"({len(features)} samples, {seq_epochs} epochs)")
+                    self.train_prepared(features, targets, epochs=seq_epochs)
+                    all_features.extend(features)
+                    all_targets.extend(targets)
             except Exception as e:
                 per_symbol[symbol] = {"error": str(e)}
                 logger.warning(f"[CortexTrainer] {symbol} failed: {e}")
@@ -898,18 +1367,24 @@ class CortexTrainer:
         if not all_features:
             return {"trained": False, "reason": "no data from any symbol"}
 
-        # Shuffle combined data for better training
+        # Phase 2: Mixed shuffle training (generalization)
         import random
         combined = list(zip(all_features, all_targets))
         random.shuffle(combined)
         all_features = [x[0] for x in combined]
         all_targets = [x[1] for x in combined]
 
-        result = self.train_prepared(all_features, all_targets, epochs=epochs)
+        logger.info(f"[CortexTrainer] Phase 2: Mixed shuffle "
+                    f"({len(all_features)} samples, {mix_epochs} epochs)")
+        result = self.train_prepared(all_features, all_targets, epochs=mix_epochs)
         result["symbols"] = symbols
         result["total_samples"] = len(all_features)
         result["per_symbol"] = per_symbol
         result["elapsed_seconds"] = round(time.time() - t0, 1)
+        result["mode"] = mode or "default"
+        result["interval"] = interval
+        result["seq_epochs"] = seq_epochs
+        result["mix_epochs"] = mix_epochs
 
         logger.info(f"[CortexTrainer] All symbols trained: {result}")
         return result
@@ -921,12 +1396,20 @@ class CortexTrainer:
         Fetches recent candles NOT used for training, runs CORTEX
         inference, compares predictions to actual outcomes.
 
+        Uses a separate eval instance_id to avoid polluting live hidden
+        states, but applies the same tanh + calibrated confidence as
+        CortexAnalyzer.analyze() for consistent evaluation metrics.
+
         Returns:
             {"accuracy": float, "precision": float, "recall": float,
-             "total": int, "correct": int, ...}
+             "total": int, "correct": int, "trained": bool, ...}
         """
         if not _HAS_TORCH:
             return {"error": "torch not available"}
+
+        # Check if model is trained (matches analyze() guard)
+        if not self.cortex._brain._trained:
+            return {"error": "CORTEX not trained yet", "trained": False}
 
         candles = self.fetch(symbol, days=days, interval=interval)
         if len(candles) < 250:
@@ -938,16 +1421,21 @@ class CortexTrainer:
         true_pos = 0
         pred_pos = 0
         actual_pos = 0
+        confidence_sum = 0.0
 
         for i in range(200, len(candles) - lookahead):
             vec = candles.get_feature_vector(i)
             if vec is None:
                 continue
 
-            # CORTEX prediction
+            # CORTEX prediction (separate eval instance to not pollute live)
             x = torch.tensor([vec], dtype=torch.float32)
             raw = self.cortex._brain(x, instance_id=f"eval_{symbol}")
             pred = torch.tanh(raw).item()
+
+            # Calibrated confidence (same as analyze())
+            confidence = min(0.95, abs(pred) ** 0.5)
+            confidence_sum += confidence
 
             actual = targets_raw[i]
             total += 1
@@ -965,9 +1453,13 @@ class CortexTrainer:
             if actual > 0.1:
                 actual_pos += 1
 
+        # Clean up eval instance state
+        self.cortex._brain.reset_instance(f"eval_{symbol}")
+
         accuracy = correct / total if total > 0 else 0
         precision = true_pos / pred_pos if pred_pos > 0 else 0
         recall = true_pos / actual_pos if actual_pos > 0 else 0
+        avg_confidence = confidence_sum / total if total > 0 else 0
 
         return {
             "symbol": symbol,
@@ -976,7 +1468,9 @@ class CortexTrainer:
             "accuracy": round(accuracy, 4),
             "precision": round(precision, 4),
             "recall": round(recall, 4),
+            "avg_confidence": round(avg_confidence, 4),
             "pred_positive": pred_pos,
             "actual_positive": actual_pos,
             "true_positive": true_pos,
+            "trained": True,
         }

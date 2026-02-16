@@ -40,6 +40,15 @@ from typing import Dict, List, Optional, Any, Callable
 
 logger = logging.getLogger(__name__)
 
+# Shared CORTEX analyzer — set by runtime for multi_tf_analysis integration
+_shared_cortex = None
+
+
+def set_shared_cortex(cortex):
+    """Wire a shared CortexAnalyzer for multi_tf_analysis CORTEX output."""
+    global _shared_cortex
+    _shared_cortex = cortex
+
 
 # Browser tool imports (graceful fallback if browser.py or playwright missing)
 try:
@@ -2603,6 +2612,76 @@ def get_multi_timeframe_analysis(query: str) -> str:
         ]
         out.append("")
         out.append(f"AI_FEATURES: {'|'.join(feat_parts)}")
+
+        # --- CORTEX Brain analysis (3 modes: scalp / stable / secure) ---
+        if _shared_cortex and _shared_cortex._brain._trained:
+            try:
+                # Build analysis dict matching parse_analysis format
+                cortex_analysis = {
+                    "current": current, "rsi": ds.get("rsi", 50.0),
+                    "rsi6": ds.get("rsi6", 50.0),
+                    "ema21": ds.get("ema21", current),
+                    "ema50": ds.get("ema50", current),
+                    "ema200": ds.get("ema200", current),
+                    "atr_daily": ds.get("atr", 0.0),
+                    "atr": ds.get("atr", 0.0),
+                    "macd_hist": ds.get("macd_hist", 0.0),
+                    "bb_upper": ds.get("bb_upper", current * 1.02),
+                    "bb_lower": ds.get("bb_lower", current * 0.98),
+                    "adx": ds.get("adx", 25.0),
+                    "keltner_pos": ds.get("keltner_pos", 0.0),
+                    "rel_vol": ds.get("rel_vol", 0.0),
+                    "obv_dir": ds.get("obv_dir", 0.0),
+                    "vwap": ds.get("vwap", current),
+                    "body_ratio": ds.get("body_ratio", 0.5),
+                    "upper_wick": ds.get("upper_wick", 0.25),
+                    "lower_wick": ds.get("lower_wick", 0.25),
+                    "funding_rate": funding_rate,
+                    "oi_change": oi_change_pct,
+                    "fear_greed_value": 50,  # neutral default (tool doesn't fetch)
+                    "poly_up_prob": 0.5,
+                    "total_tfs": total_tfs,
+                }
+                # Per-TF scores for recount_confluence
+                _tf_label_to_key = {
+                    "5-MIN (Precision)": "score_5m",
+                    "15-MIN (Scalp)": "score_15m",
+                    "30-MIN (Scalp+)": "score_30m",
+                    "1-HOUR (Entry Timing)": "score_1h",
+                    "4-HOUR (Intraday)": "score_4h",
+                    "DAILY (Swing)": "score_daily",
+                    "WEEKLY (Major Trend)": "score_weekly",
+                }
+                for label, stats_d in all_tf_stats.items():
+                    sk = _tf_label_to_key.get(label)
+                    if sk:
+                        cortex_analysis[sk] = stats_d.get("tf_score", 0)
+
+                from qor.trading import recount_confluence, TRIPLE_SCREEN
+                out.append("")
+                out.append("CORTEX BRAIN:")
+                for mode in ("scalp", "stable", "secure"):
+                    # Deep-copy analysis for each mode
+                    mode_analysis = dict(cortex_analysis)
+                    # Recount confluence using mode-specific TFs
+                    mode_analysis["bullish_tfs"] = bullish_tfs
+                    mode_analysis["bearish_tfs"] = bearish_tfs
+                    recount_confluence(mode_analysis, mode)
+                    # Run CORTEX
+                    instance = f"{asset_name}_{mode}"
+                    result = _shared_cortex.analyze(mode_analysis, instance)
+                    sig = result["signal"]
+                    conf = result["confidence"]
+                    label = result["label"]
+                    b = mode_analysis.get("bullish_tfs", 0)
+                    t = mode_analysis.get("total_tfs", 1) or 1
+                    veto = mode_analysis.get("trend_veto", "NEUTRAL")
+                    out.append(
+                        f"  {mode:7s}: {label:12s} "
+                        f"(signal={sig:+.3f}, conf={conf:.0%}) "
+                        f"[{b}/{t} TFs bullish, veto={veto}]")
+            except Exception as e:
+                out.append(f"  CORTEX: error — {e}")
 
     return "\n".join(out)
 

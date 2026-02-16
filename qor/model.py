@@ -772,6 +772,7 @@ class QORModel(nn.Module):
         }
 
     @torch.no_grad()
+    @torch.no_grad()
     def generate(self, input_ids: torch.Tensor,
                  max_new_tokens: int = 256,
                  temperature: float = 0.8,

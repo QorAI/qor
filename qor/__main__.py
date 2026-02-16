@@ -1198,6 +1198,7 @@ def cmd_run(args):
 
     # Set system prompt with user name + interests + cautions
     gate.system_prompt = _build_system_prompt(user_name, profile, model=learner.model)
+    gate._user_name = user_name
 
     print(f"\n{'='*60}")
     print(f"  QOR Runtime — Direct DB Storage (No Batching)")
@@ -1265,6 +1266,7 @@ def cmd_run(args):
                 profile["user_name"] = user_name
                 save_profile_to_tree(graph, user_id, profile)  # user_id = system_id
                 gate.system_prompt = _build_system_prompt(user_name, profile, model=learner.model)
+                gate._user_name = user_name
                 print(f"\n  Nice to meet you, {user_name}! Let's get started.\n")
                 break
             else:
@@ -1281,6 +1283,14 @@ def cmd_run(args):
     # Set user_id on gate for knowledge tree — uses system_id (permanent)
     gate._user_id = user_id  # "user:sys-xxxxxxxxxxxx"
 
+    # Resize dedicated I/O pools from config (chat vs system separation)
+    try:
+        from qor.asset_context import resize_chat_pool, resize_system_pool
+        resize_chat_pool(config.runtime.chat_io_workers)
+        resize_system_pool(config.runtime.system_io_workers)
+    except Exception:
+        pass
+
     # Initialize query pool for parallel chat processing
     query_pool = None
     query_pool_output = None
@@ -1293,7 +1303,9 @@ def cmd_run(args):
                 max_workers=config.runtime.query_pool_workers,
                 verbose=verbose,
             )
-            print(f"  Query pool: {config.runtime.query_pool_workers} workers")
+            print(f"  Query pool: {config.runtime.query_pool_workers} workers "
+                  f"(chat I/O: {config.runtime.chat_io_workers}, "
+                  f"system I/O: {config.runtime.system_io_workers})")
         except Exception as e:
             print(f"  Query pool: disabled ({e})")
             query_pool = None
@@ -1506,14 +1518,16 @@ def cmd_run(args):
                 print("  To enable: set trading.enabled=True in config + API keys")
             print()
             continue
-        if question.lower() == "positions":
+        if question.lower() in ("positions", "futures positions"):
+            any_shown = False
+            # --- Spot positions ---
             te = runtime._trading_engine
             if te:
-                opens = te.store.get_open_trades()
-                if not opens:
-                    print("  No open positions")
-                else:
-                    for t in opens:
+                spot_opens = te.store.get_open_trades()
+                if spot_opens:
+                    print("  SPOT:")
+                    any_shown = True
+                    for t in spot_opens:
                         pair = t["symbol"] + "USDT"
                         try:
                             current = te.client.get_price(pair)
@@ -1527,16 +1541,60 @@ def cmd_run(args):
                             dca = t.get("dca_count", 0)
                             dca_str = f" DCA: {dca}x" if dca else ""
                             tp1_str = " [TP1 taken]" if t.get("tp1_hit") else ""
-                            print(f"  {t['symbol']}: entry ${t['entry_price']:,.2f} "
+                            print(f"    {t['symbol']} LONG: entry ${t['entry_price']:,.2f} "
                                   f"now ${current:,.2f} ({pct:+.2f}%) "
                                   f"SL: ${t['stop_loss']:,.2f} TP1: ${t['take_profit']:,.2f}"
                                   f"{tp2_str}{dca_str}{tp1_str} "
                                   f"P&L: ${unrealized:+,.2f}")
                         else:
-                            print(f"  {t['symbol']}: entry ${t['entry_price']:,.2f} "
+                            print(f"    {t['symbol']} LONG: entry ${t['entry_price']:,.2f} "
                                   f"SL: ${t['stop_loss']:,.2f} TP: ${t['take_profit']:,.2f}")
-            else:
-                print("  Trading engine not active")
+            # --- Futures positions ---
+            fe = runtime._futures_engine
+            if fe:
+                fut_opens = fe.store.get_open_trades()
+                if fut_opens:
+                    print("  FUTURES:")
+                    any_shown = True
+                    for t in fut_opens:
+                        pair = t["symbol"] + "USDT"
+                        try:
+                            current = fe.client.get_price(pair)
+                        except Exception:
+                            current = 0
+                        direction = t.get("direction", "LONG")
+                        lev = t.get("leverage", 1)
+                        liq = t.get("liquidation_price", 0)
+                        funding = t.get("funding_paid", 0)
+                        if current > 0 and t["entry_price"] > 0:
+                            if direction == "LONG":
+                                unrealized = (current - t["entry_price"]) * t["quantity"]
+                                pct = ((current / t["entry_price"]) - 1) * 100
+                            else:
+                                unrealized = (t["entry_price"] - current) * t["quantity"]
+                                pct = ((t["entry_price"] / current) - 1) * 100
+                            tp2 = t.get("take_profit2", 0)
+                            tp2_str = f" TP2: ${tp2:,.2f}" if tp2 else ""
+                            dca = t.get("dca_count", 0)
+                            dca_str = f" DCA: {dca}x" if dca else ""
+                            tp1_str = " [TP1 taken]" if t.get("tp1_hit") else ""
+                            liq_str = f" Liq: ${liq:,.2f}" if liq > 0 else ""
+                            fund_str = f" Fund: ${funding:,.4f}" if funding else ""
+                            print(f"    {t['symbol']} {direction} {lev}x: "
+                                  f"entry ${t['entry_price']:,.2f} "
+                                  f"now ${current:,.2f} ({pct:+.2f}%) "
+                                  f"SL: ${t['stop_loss']:,.2f} TP1: ${t['take_profit']:,.2f}"
+                                  f"{tp2_str}{dca_str}{tp1_str}{liq_str}{fund_str} "
+                                  f"P&L: ${unrealized:+,.2f}")
+                        else:
+                            print(f"    {t['symbol']} {direction} {lev}x: "
+                                  f"entry ${t['entry_price']:,.2f} "
+                                  f"SL: ${t['stop_loss']:,.2f} TP: ${t['take_profit']:,.2f}")
+            if not any_shown:
+                if not te and not fe:
+                    print("  No trading engines active")
+                else:
+                    print("  No open positions")
             print()
             continue
         if question.lower() == "trades":
@@ -1590,50 +1648,7 @@ def cmd_run(args):
                 print("  To enable: start futures (requires API keys)")
             print()
             continue
-        if question.lower() == "futures positions":
-            fe = runtime._futures_engine
-            if fe:
-                opens = fe.store.get_open_trades()
-                if not opens:
-                    print("  No open futures positions")
-                else:
-                    for t in opens:
-                        pair = t["symbol"] + "USDT"
-                        try:
-                            current = fe.client.get_price(pair)
-                        except Exception:
-                            current = 0
-                        direction = t.get("direction", "LONG")
-                        lev = t.get("leverage", 1)
-                        liq = t.get("liquidation_price", 0)
-                        funding = t.get("funding_paid", 0)
-                        if current > 0 and t["entry_price"] > 0:
-                            if direction == "LONG":
-                                unrealized = (current - t["entry_price"]) * t["quantity"]
-                                pct = ((current / t["entry_price"]) - 1) * 100
-                            else:
-                                unrealized = (t["entry_price"] - current) * t["quantity"]
-                                pct = ((t["entry_price"] / current) - 1) * 100
-                            tp2 = t.get("take_profit2", 0)
-                            tp2_str = f" TP2: ${tp2:,.2f}" if tp2 else ""
-                            dca = t.get("dca_count", 0)
-                            dca_str = f" DCA: {dca}x" if dca else ""
-                            tp1_str = " [TP1 taken]" if t.get("tp1_hit") else ""
-                            liq_str = f" Liq: ${liq:,.2f}" if liq > 0 else ""
-                            print(f"  {t['symbol']} {direction} {lev}x: "
-                                  f"entry ${t['entry_price']:,.2f} "
-                                  f"now ${current:,.2f} ({pct:+.2f}%) "
-                                  f"SL: ${t['stop_loss']:,.2f} TP1: ${t['take_profit']:,.2f}"
-                                  f"{tp2_str}{dca_str}{tp1_str}{liq_str} "
-                                  f"P&L: ${unrealized:+,.2f}")
-                        else:
-                            print(f"  {t['symbol']} {direction} {lev}x: "
-                                  f"entry ${t['entry_price']:,.2f} "
-                                  f"SL: ${t['stop_loss']:,.2f} TP: ${t['take_profit']:,.2f}")
-            else:
-                print("  Futures engine not active")
-            print()
-            continue
+        # "futures positions" is handled above by the merged "positions" command
         if question.lower() == "futures trades":
             fe = runtime._futures_engine
             if fe:
@@ -2264,6 +2279,7 @@ def cmd_run(args):
                 # Name is just a display property on the user node
                 save_profile_to_tree(graph, gate._user_id, profile)
                 gate.system_prompt = _build_system_prompt(user_name, profile, model=learner.model)
+                gate._user_name = user_name
                 print(f"  [Got it! I'll call you {user_name} from now on.]\n")
 
         # Get recent chat context for follow-up resolution

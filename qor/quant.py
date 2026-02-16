@@ -898,6 +898,76 @@ class MarketHMM:
         return loaded
 
     # -----------------------------------------------------------------
+    # Pre-warm from historical klines (skip 2.5h cold start)
+    # -----------------------------------------------------------------
+
+    def warm_from_klines(self, klines: list, symbol: str = "BTC"):
+        """Feed historical klines to build observation history, skipping cold start.
+
+        Args:
+            klines: Binance kline format list:
+                [[open_time, open, high, low, close, volume, ...], ...]
+            symbol: Trading symbol for per-symbol state tracking.
+
+        After calling this, get_signal() will produce real signals immediately
+        instead of returning neutral for the first 30 ticks (~2.5 hours).
+        """
+        if not self.is_available or not _HAS_NUMPY:
+            return
+        if not klines:
+            return
+
+        import math
+        fed = 0
+        prev_close = 0.0
+        for k in klines:
+            try:
+                o, h, low, close, vol = (
+                    float(k[1]), float(k[2]), float(k[3]),
+                    float(k[4]), float(k[5]),
+                )
+            except (IndexError, ValueError, TypeError):
+                continue
+            if close <= 0:
+                continue
+
+            # Build a minimal analysis dict from kline OHLCV
+            atr_approx = h - low  # single-candle range as ATR proxy
+            rsi_approx = 50.0     # neutral default (no multi-period RSI from single kline)
+            if prev_close > 0:
+                change = close - prev_close
+                # Rough RSI proxy: positive change → RSI > 50, negative → < 50
+                pct = change / prev_close
+                rsi_approx = 50 + pct * 500  # scale: 1% move ≈ 5 RSI points
+                rsi_approx = max(10, min(90, rsi_approx))
+
+            ema_proxy = (o + close) / 2  # midpoint as EMA stand-in
+            analysis = {
+                "current": close,
+                "atr": atr_approx,
+                "rsi": rsi_approx,
+                "macd_hist": 0,
+                "ema21": ema_proxy,
+                "ema50": ema_proxy,
+                "bullish_tfs": 4 if close > o else 3,
+                "total_tfs": 7,
+            }
+            obs = self.build_observation(analysis, symbol=symbol)
+            if obs is not None:
+                if symbol not in self._obs_history:
+                    self._obs_history[symbol] = []
+                    self._state_history[symbol] = []
+                self._obs_history[symbol].append(obs)
+                if len(self._obs_history[symbol]) > self._max_history:
+                    self._obs_history[symbol] = self._obs_history[symbol][-self._max_history:]
+                fed += 1
+            prev_close = close
+
+        if fed > 0:
+            logger.info("[HMM] Warmed %s with %d historical candles "
+                        "(need %d for signals)", symbol, fed, self.MIN_HISTORY)
+
+    # -----------------------------------------------------------------
     # Observation builder — converts TA analysis dict to 6-dim vector
     # -----------------------------------------------------------------
 

@@ -663,7 +663,7 @@ def _register_dashboard_routes(app, config, runtime):
         from qor.tools import (
             _fetch_ohlc_binance, _calc_rsi, _calc_ema, _calc_macd,
             _calc_bollinger, _calc_atr, _calc_adx, _calc_trade_levels,
-            _find_support_resistance,
+            _find_support_resistance, _compute_tf_line, _score_tf,
             _fetch_ohlc_yahoo, _COMMODITY_YAHOO, _FOREX_YAHOO, _extract_stock_symbol,
         )
         from qor.quant import classify_asset
@@ -715,7 +715,7 @@ def _register_dashboard_routes(app, config, runtime):
         supports, resistances = _find_support_resistance(highs, lows, closes)
         levels = _calc_trade_levels(current, atr, ema21, ema50, rsi, bb_upper, bb_lower, supports, resistances)
 
-        # Multi-TF confluence
+        # Multi-TF confluence — full scoring with ALL indicators via _score_tf()
         tf_results = []
         if is_crypto:
             tf_map = [("W", "1w", 100), ("D", "1d", 200), ("4H", "4h", 200),
@@ -725,7 +725,9 @@ def _register_dashboard_routes(app, config, runtime):
                       ("15m", "15m", "1d"), ("5m", "5m", "1d")]
 
         bullish_tfs = 0
+        bearish_tfs = 0
         total_tfs = 0
+        total_score = 0
         for tf_info in tf_map:
             tf_name = tf_info[0]
             try:
@@ -735,20 +737,23 @@ def _register_dashboard_routes(app, config, runtime):
                     tf_ohlc = _fetch_ohlc_yahoo(yahoo_sym, tf_info[1], tf_info[2])
                 if tf_ohlc and len(tf_ohlc["closes"]) >= 20:
                     total_tfs += 1
-                    tc = tf_ohlc["closes"][-1]
-                    te = _calc_ema(tf_ohlc["closes"], 21)
-                    tr = _calc_rsi(tf_ohlc["closes"], 14)
-                    tm, _, th = _calc_macd(tf_ohlc["closes"])
-                    bias = "BULLISH" if tc > te else "BEARISH"
-                    if tc > te:
+                    _, tf_stats = _compute_tf_line(tf_ohlc, tf_name)
+                    tf_score = tf_stats.get("tf_score", 0)
+                    total_score += tf_score
+                    tf_bias = "BULLISH" if tf_score > 10 else "BEARISH" if tf_score < -10 else "NEUTRAL"
+                    if tf_score > 10:
                         bullish_tfs += 1
-                    tf_results.append({"name": tf_name, "bias": bias, "rsi": round(tr, 1),
-                                       "ema_trend": "above" if tc > te else "below",
-                                       "macd_trend": "bullish" if th > 0 else "bearish"})
+                    elif tf_score < -10:
+                        bearish_tfs += 1
+                    tf_results.append({
+                        "name": tf_name, "bias": tf_bias, "score": tf_score,
+                        "rsi": round(tf_stats.get("rsi", 50), 1),
+                        "ema_trend": "above" if tf_stats["current"] > tf_stats["ema21"] else "below",
+                        "macd_trend": "bullish" if tf_stats.get("macd_hist", 0) > 0 else "bearish",
+                        "adx": round(tf_stats.get("adx", 0), 1),
+                    })
             except Exception:
                 pass
-
-        bearish_tfs = total_tfs - bullish_tfs
         if bullish_tfs > bearish_tfs:
             overall_bias = "BULLISH"
         elif bearish_tfs > bullish_tfs:
@@ -759,7 +764,7 @@ def _register_dashboard_routes(app, config, runtime):
         result = {
             "symbol": symbol, "timestamp": time.time(),
             "bias": overall_bias,
-            "bullish_tfs": bullish_tfs, "bearish_tfs": bearish_tfs, "total_tfs": total_tfs,
+            "bullish_tfs": bullish_tfs, "bearish_tfs": bearish_tfs, "total_tfs": total_tfs, "total_score": total_score,
             "entry": round(levels["entry"], 2), "stop_loss": round(levels["stop_loss"], 2),
             "tp1": round(levels["tp1"], 2), "tp2": round(levels["tp2"], 2),
             "risk_reward": round(levels["risk_reward"], 2),
@@ -1450,6 +1455,7 @@ def _register_routes(app, config, runtime, learner, gate, graph, rag,
         except Exception:
             pass
         gate.system_prompt = _build_identity(profile, gate)
+        gate._user_name = new_name
         return jsonify({"ok": True, "user_name": new_name})
 
     @app.route('/api/profile', methods=['POST'])
@@ -1475,6 +1481,7 @@ def _register_routes(app, config, runtime, learner, gate, graph, rag,
         except Exception:
             pass
         gate.system_prompt = _build_identity(profile, gate)
+        gate._user_name = profile.get("user_name", "")
         return jsonify({"ok": True})
 
     # ---- Knowledge ----
@@ -4062,6 +4069,7 @@ def run_full_server(config: QORConfig, checkpoint_path: str = None,
         identity += (" You CAN hear and analyze audio. When the user provides an audio file path, "
                       "you will hear the audio contents.")
     gate.system_prompt = identity
+    gate._user_name = user_name  # for identity.txt {name} replacement
 
     # ================================================================
     # Flask App with ALL endpoints

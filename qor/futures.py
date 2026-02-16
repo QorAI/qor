@@ -847,37 +847,42 @@ class FuturesPositionManager:
         return atr
 
     def _get_reversal_threshold(self, total_tfs: int) -> int:
-        """Mode-aware reversal threshold.
+        """Mode-aware reversal threshold (setup TFs only).
 
-        - scalp:  2 TFs (5m-30m flip fast, don't wait for daily/weekly)
-        - stable: 3 TFs (30m-4h, moderate patience)
-        - secure: 4 TFs (4h-1w, high conviction needed)
+        With Triple Screen, total_tfs is the setup TF count:
+        - scalp:  total=2 → need 2 (both 15m + 30m flip)
+        - stable: total=1 → need 1 (4h flips)
+        - secure: total=1 → need 1 (daily flips)
+
+        Additionally, if the trend TF flips against position, that alone
+        triggers reversal (checked separately via trend_veto).
         """
-        mode = getattr(self.config, "trade_mode", "scalp")
-        if mode == "scalp":
-            return min(2, total_tfs)
-        elif mode == "stable":
-            return min(3, total_tfs)
-        else:  # secure
-            return max(4, int(total_tfs * 2 / 3))
+        return max(1, total_tfs)
 
     def _check_scalp_short_tf_reversal(self, analysis: dict,
                                         against: str) -> tuple:
-        """Check if 2+ of 5m/15m/30m TFs flipped against position.
+        """Check if setup + trend TFs flipped against position.
+
+        Uses Triple Screen model:
+        - scalp:  checks 15m, 30m (setup) + 1h (trend)
+        - stable: checks 4h (setup) + daily (trend)
+        - secure: checks daily (setup) + weekly (trend)
 
         against: "LONG" or "SHORT" — the direction we're checking against.
-        For LONG: checks if short TFs turned bearish.
-        For SHORT: checks if short TFs turned bullish.
+        For LONG: checks if TFs turned bearish.
+        For SHORT: checks if TFs turned bullish.
 
         Returns (flipped: bool, count: int, details: str).
         """
         mode = getattr(self.config, "trade_mode", "scalp")
-        if mode != "scalp":
-            return False, 0, ""
+        from qor.trading import TRIPLE_SCREEN
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
 
         flipped = 0
         tfs_checked = []
-        for tf_name in ("5m", "15m", "30m"):
+        # Check setup + trend TFs (not entry TF)
+        for score_key in screens["setup"] + screens["trend"]:
+            tf_name = score_key.replace("score_", "")
             bias = analysis.get(f"bias_{tf_name}", "").upper()
             if not bias:
                 continue
@@ -888,7 +893,10 @@ class FuturesPositionManager:
                 flipped += 1
                 tfs_checked.append(tf_name)
 
-        if flipped >= 2:
+        # Need majority of (setup + trend) to flip
+        total_checked = len(screens["setup"]) + len(screens["trend"])
+        threshold = max(2, (total_checked + 1) // 2)
+        if flipped >= threshold:
             detail = "+".join(tfs_checked)
             return True, flipped, detail
         return False, flipped, ""
@@ -914,15 +922,12 @@ class FuturesPositionManager:
         # So: close_div = opposite of position direction
         close_div = "bullish" if direction == "SHORT" else "bearish"
 
-        if mode == "scalp":
-            tf_checks = ["5m", "15m", "30m"]
-            min_tfs_matching = 2  # at least 2 of 3 TFs
-        elif mode == "stable":
-            tf_checks = ["30m", "1h", "4h"]
-            min_tfs_matching = 2
-        else:  # secure
-            tf_checks = ["1h", "4h"]
-            min_tfs_matching = 2
+        # Use Triple Screen setup + trend TFs for divergence check
+        from qor.trading import TRIPLE_SCREEN
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
+        tf_checks = [k.replace("score_", "") for k in
+                     screens["setup"] + screens["trend"]]
+        min_tfs_matching = max(2, len(tf_checks) // 2)
 
         tfs_with_div = 0
         tfs_with_extreme_rsi = 0
@@ -986,6 +991,11 @@ class FuturesPositionManager:
                      "reason": "analysis not available"}]
 
         analysis = self._parse_analysis(analysis_text)
+
+        # Elder Triple Screen: recount confluence using only mode-relevant TFs
+        mode = getattr(self.config, "trade_mode", "scalp")
+        from qor.trading import recount_confluence
+        recount_confluence(analysis, mode)
 
         try:
             current = self.client.get_price(pair)
@@ -1371,20 +1381,21 @@ class FuturesPositionManager:
             })
             return actions
 
-        # Adverse momentum early exit — short TF RSI extreme against LONG
-        # Checks 5m + 15m + 30m RSI (all scalp TFs)
-        rsi_5m = analysis.get("rsi_5m", 50)
-        rsi_15m = analysis.get("rsi_15m", 50)
-        rsi_30m = analysis.get("rsi_30m", 50)
-        # Close if losing >1% AND any 2 of 3 short TFs show extreme bearish RSI
-        bearish_rsi_count = sum(1 for r in [rsi_5m, rsi_15m, rsi_30m]
-                                if r < 30)
+        # Adverse momentum early exit — setup+entry TF RSI extreme against LONG
+        from qor.trading import TRIPLE_SCREEN
+        mode = getattr(self.config, "trade_mode", "scalp")
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
+        momentum_tfs = [k.replace("score_", "")
+                        for k in screens["setup"] + screens["entry"]]
+        momentum_rsis = {tf: analysis.get(f"rsi_{tf}", 50)
+                         for tf in momentum_tfs}
+        bearish_rsi_count = sum(1 for r in momentum_rsis.values() if r < 30)
         if pnl_pct < -1.0 and bearish_rsi_count >= 2:
+            rsi_str = " ".join(f"{tf}={v:.0f}" for tf, v in momentum_rsis.items())
             actions.append({
                 "action": "CLOSE", "symbol": symbol, "trade_id": tid,
                 "close_side": "SELL", "exit_status": "closed_momentum",
-                "reason": (f"adverse momentum: RSI 5m={rsi_5m:.0f} "
-                           f"15m={rsi_15m:.0f} 30m={rsi_30m:.0f}, "
+                "reason": (f"adverse momentum: RSI {rsi_str}, "
                            f"P&L {pnl_pct:+.1f}%"),
             })
             return actions
@@ -1508,20 +1519,21 @@ class FuturesPositionManager:
             })
             return actions
 
-        # Adverse momentum early exit — short TF RSI extreme against SHORT
-        # Checks 5m + 15m + 30m RSI (all scalp TFs)
-        rsi_5m = analysis.get("rsi_5m", 50)
-        rsi_15m = analysis.get("rsi_15m", 50)
-        rsi_30m = analysis.get("rsi_30m", 50)
-        # Close if losing >1% AND any 2 of 3 short TFs show extreme bullish RSI
-        bullish_rsi_count = sum(1 for r in [rsi_5m, rsi_15m, rsi_30m]
-                                if r > 70)
+        # Adverse momentum early exit — setup+entry TF RSI extreme against SHORT
+        from qor.trading import TRIPLE_SCREEN
+        mode = getattr(self.config, "trade_mode", "scalp")
+        screens = TRIPLE_SCREEN.get(mode, TRIPLE_SCREEN["scalp"])
+        momentum_tfs = [k.replace("score_", "")
+                        for k in screens["setup"] + screens["entry"]]
+        momentum_rsis_s = {tf: analysis.get(f"rsi_{tf}", 50)
+                           for tf in momentum_tfs}
+        bullish_rsi_count = sum(1 for r in momentum_rsis_s.values() if r > 70)
         if pnl_pct < -1.0 and bullish_rsi_count >= 2:
+            rsi_str = " ".join(f"{tf}={v:.0f}" for tf, v in momentum_rsis_s.items())
             actions.append({
                 "action": "CLOSE", "symbol": symbol, "trade_id": tid,
                 "close_side": "BUY", "exit_status": "closed_momentum",
-                "reason": (f"adverse momentum: RSI 5m={rsi_5m:.0f} "
-                           f"15m={rsi_15m:.0f} 30m={rsi_30m:.0f}, "
+                "reason": (f"adverse momentum: RSI {rsi_str}, "
                            f"P&L {pnl_pct:+.1f}%"),
             })
             return actions
@@ -1705,12 +1717,13 @@ class FuturesPositionManager:
         # Use mode-appropriate ATR for SL/TP (scalp=short TF, secure=daily)
         atr = self._get_trade_atr(analysis)
 
-        # ATR floor: minimum 0.3% of price to prevent unreasonably tight SL/TP
-        if current > 0 and atr > 0:
+        # ATR floor: minimum 0.3% of price — applied ALWAYS (even when ATR=0)
+        # Without this, ATR=0 → SL=0 → unprotected trade
+        if current > 0:
             min_atr = current * 0.003
             if atr < min_atr:
-                logger.debug(f"[FuturesPM] ATR floor: {atr:.4f} -> {min_atr:.4f} "
-                             f"(0.3% of ${current:,.2f})")
+                logger.info(f"[FuturesPM] ATR floor: {atr:.4f} -> {min_atr:.4f} "
+                            f"(0.3% of ${current:,.2f})")
                 atr = min_atr
 
         # Confluence score strength check — weak signals should not enter
@@ -1740,6 +1753,15 @@ class FuturesPositionManager:
             direction = "LONG"
         else:
             hold["reason"] = f"neutral: {bullish_tfs} bullish = {bearish_tfs} bearish"
+            return [hold]
+
+        # Elder Triple Screen: trend TF veto (direction-aware)
+        trend_veto = analysis.get("trend_veto", "NEUTRAL")
+        if direction == "LONG" and trend_veto == "BEARISH":
+            hold["reason"] = f"trend TF veto: {trend_veto} (no longs against trend)"
+            return [hold]
+        if direction == "SHORT" and trend_veto == "BULLISH":
+            hold["reason"] = f"trend TF veto: {trend_veto} (no shorts against trend)"
             return [hold]
 
         entry_price = current  # Always use live price, not text-parsed daily-based entry
@@ -1846,6 +1868,10 @@ class FuturesPositionManager:
                     tp2_price = current - (current - tp2_price) * 0.8
             risk = sl_price - current
             reward = current - tp1_price
+
+        # Subtract estimated slippage from reward (applies to both directions)
+        slippage = current * getattr(self.config, "slippage_pct", 0.05) / 100.0
+        reward -= slippage
 
         # Funding rate — keep as hard block (real financial cost)
         funding_rate = analysis.get("funding_rate", 0.0)
@@ -2021,6 +2047,20 @@ class FuturesPositionManager:
             size_mult *= 0.7
             mult_notes.append(f"HMM(CHOPPY)×0.7")
 
+        # Advisory TFs — higher TFs outside active set slightly reduce size
+        # if they conflict with trade direction (never block, per Elder)
+        adv_against = 0
+        if direction == "LONG":
+            adv_against = analysis.get("advisory_bearish", 0)
+        else:
+            adv_against = analysis.get("advisory_bullish", 0)
+        if adv_against >= 2:
+            size_mult *= 0.8
+            mult_notes.append(f"advisory({adv_against}contra)×0.8")
+        elif adv_against >= 1:
+            size_mult *= 0.9
+            mult_notes.append(f"advisory({adv_against}contra)×0.9")
+
         # ============================================================
         # Compute Kelly position size WITH all signal multipliers
         # This IS the decision — size is known at decision time
@@ -2117,15 +2157,16 @@ class FuturesPositionManager:
         if open_count >= self.config.max_open_positions:
             return f"max positions reached ({open_count}/{self.config.max_open_positions})"
 
-        # Multi-TF confluence — futures can go EITHER direction
+        # Setup TF confluence — futures can go EITHER direction
+        # (Trend veto is checked later in _evaluate_entry for direction-awareness)
         if analysis["total_tfs"] > 0:
-            min_required = max(3, analysis["total_tfs"] // 2 + 1)
+            min_required = max(1, (analysis["total_tfs"] + 1) // 2)  # majority
             bullish = analysis["bullish_tfs"]
             bearish = analysis["bearish_tfs"]
             # Allow entry if EITHER direction has enough confluence
             if bullish < min_required and bearish < min_required:
                 return (f"weak confluence: {bullish} bullish, {bearish} bearish "
-                        f"of {analysis['total_tfs']} (need {min_required})")
+                        f"of {analysis['total_tfs']} setup TFs (need {min_required})")
 
         # Quant edge validation — Expectancy + Risk of Ruin + Max Drawdown
         sym_closed = [t for t in self.store.trades.values()
@@ -2177,7 +2218,8 @@ class FuturesPositionManager:
                 bench = analysis.get("price_returns", [])
                 if bench and len(returns) >= 10:
                     n = min(len(returns), len(bench))
-                    analysis["quant_alpha"] = qm.capm_alpha(returns[:n], bench[:n])
+                    capm = qm.capm_alpha(returns[:n], bench[:n])
+                    analysis["quant_alpha"] = capm["alpha"]
                     analysis["quant_ir"] = qm.information_ratio(returns[:n], bench[:n])
             except Exception:
                 pass
@@ -2392,11 +2434,27 @@ class FuturesEngine:
                 logger.warning(f"[Futures] Setup {pair} failed: {e}")
         self._leverage_set = True
 
+    def _warm_hmm(self):
+        """Pre-warm HMM with historical klines to skip the 2.5h cold start."""
+        if not self.hmm or not self.hmm.is_available:
+            return
+        for symbol in self.config.symbols:
+            history = self.hmm._obs_history.get(symbol, [])
+            if len(history) >= self.hmm.MIN_HISTORY:
+                continue
+            pair = self.client.format_pair(symbol)
+            try:
+                klines = self.client.get_klines(pair, interval="5m", limit=50)
+                self.hmm.warm_from_klines(klines, symbol=symbol)
+            except Exception as e:
+                logger.warning(f"[Futures] HMM warm-up failed for {symbol}: {e}")
+
     def start(self):
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
         self._setup_symbols()
+        self._warm_hmm()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="qor-futures")
         self._thread.start()
@@ -2601,18 +2659,19 @@ class FuturesEngine:
                 for ex_pos in positions:
                     decisions = self.manager.evaluate_symbol_with_position(
                         symbol, ex_pos)
-                    self._execute_decisions(symbol, decisions)
+                    self._execute_decisions(symbol, decisions,
+                                            has_position=True)
 
                 # --- Step B: Evaluate new entry if room ---
                 # Check global limits
                 if total_open >= self.config.max_open_positions:
                     if not positions:
-                        self._log_activity(symbol, "HOLD",
+                        self._log_activity(symbol, "WAIT",
                             f"Max positions ({total_open}/{self.config.max_open_positions})")
                     continue
                 if allocated > 0 and margin_used >= allocated:
                     if not positions:
-                        self._log_activity(symbol, "HOLD",
+                        self._log_activity(symbol, "WAIT",
                             f"Fund limit (${margin_used:,.0f}/${allocated:,.0f})")
                     continue
 
@@ -2635,9 +2694,10 @@ class FuturesEngine:
                             if d["action"] != "OPEN"
                             or d.get("direction") not in open_directions
                         ]
-                    self._execute_decisions(symbol, decisions)
+                    self._execute_decisions(symbol, decisions,
+                                            has_position=bool(positions))
                 elif not positions:
-                    self._log_activity(symbol, "HOLD", "No action needed")
+                    self._log_activity(symbol, "WAIT", "No action needed")
 
             except Exception as e:
                 logger.error(f"[Futures] Error processing {symbol}: {e}")
@@ -2645,7 +2705,8 @@ class FuturesEngine:
 
         self.store.save()
 
-    def _execute_decisions(self, symbol: str, decisions: list):
+    def _execute_decisions(self, symbol: str, decisions: list,
+                           has_position: bool = False):
         """Execute a list of trading decisions."""
         for decision in decisions:
             action = decision["action"]
@@ -2654,11 +2715,20 @@ class FuturesEngine:
             if decision.get("cortex_label"):
                 cortex_info = (f" [CORTEX: {decision['cortex_label']} "
                                f"{decision.get('cortex_signal', 0):.2f}]")
-            logger.info(f"[Futures] {symbol}: {action} -- {reason}{cortex_info}")
-            self._log_activity(symbol, action, f"{reason}{cortex_info}")
+            # Show WAIT instead of HOLD when there's no position
+            display_action = action
+            if action == "HOLD" and not has_position:
+                display_action = "WAIT"
+            logger.info(f"[Futures] {symbol}: {display_action} -- {reason}{cortex_info}")
+            self._log_activity(symbol, display_action, f"{reason}{cortex_info}")
 
             if action == "OPEN":
+                open_count_before = len(self.store.get_open_trades())
                 self._execute_open(symbol, decision)
+                open_count_after = len(self.store.get_open_trades())
+                if open_count_after <= open_count_before:
+                    self._log_activity(symbol, "OPEN_FAILED",
+                                       "Order did not execute — check logs above")
             elif action == "CLOSE":
                 self._execute_close(symbol, decision)
             elif action == "PARTIAL_TP":
@@ -2667,7 +2737,7 @@ class FuturesEngine:
                 self._execute_dca(symbol, decision)
             elif action == "ADJUST_SL":
                 self._execute_adjust_sl(decision)
-            # HOLD -> no action
+            # HOLD/WAIT -> no action
 
     # ------------------------------------------------------------------
     # Execution methods
@@ -2713,6 +2783,7 @@ class FuturesEngine:
         quote = getattr(self.client, 'quote', 'USDT')
         direction = decision["direction"]
         order_side = decision["order_side"]
+        logger.info(f"[Futures] _execute_open({pair}, {direction}, side={order_side})")
 
         try:
             quote_balance = self.client.get_balance(quote)
@@ -2747,15 +2818,21 @@ class FuturesEngine:
             logger.error(f"[Futures] Cannot get price for {pair}: {e}")
             return
         if price <= 0:
+            logger.warning(f"[Futures] OPEN {direction} {pair}: price is {price}, skipping")
             return
 
-        quantity = self.client.round_qty(pair, notional / price)
+        raw_qty = notional / price
+        quantity = self.client.round_qty(pair, raw_qty)
         try:
             lot = self.client.get_lot_size(pair)
             if quantity < lot["minQty"]:
+                logger.warning(
+                    f"[Futures] OPEN {direction} {pair}: qty {quantity:.8f} < minQty "
+                    f"{lot['minQty']:.8f} (notional=${notional:.2f}, price=${price:,.2f}, "
+                    f"available=${available:.2f}, pct={position_pct:.1f}%, lev={leverage}x)")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Futures] Lot size fetch failed for {pair}: {e}")
 
         try:
             # In hedge mode, pass positionSide so Binance knows which side
@@ -2779,9 +2856,90 @@ class FuturesEngine:
         sl_price = decision["stop_loss"]
         tp_price = decision["take_profit"]
 
+        # SL and TP are MANDATORY — refuse to open unprotected trades
+        if sl_price <= 0 or tp_price <= 0:
+            logger.error(f"[Futures] REFUSING OPEN {direction} {pair}: "
+                         f"SL=${sl_price:,.2f} TP=${tp_price:,.2f} — "
+                         f"cannot open trade without SL/TP. "
+                         f"Closing market order immediately.")
+            # Close the filled market order — no unprotected positions
+            try:
+                close_side = "SELL" if direction == "LONG" else "BUY"
+                ps = direction if getattr(self.config, 'hedge_mode', True) else None
+                self.client.place_order(pair, close_side, fill_qty,
+                                        reduce_only=not ps, position_side=ps)
+                logger.info(f"[Futures] Emergency close {pair} — no SL/TP available")
+            except Exception as close_e:
+                logger.error(f"[Futures] Emergency close FAILED {pair}: {close_e}")
+            return
+
         # Reason already includes Kelly + signal multiplier info from _evaluate_entry
         reason = decision["reason"]
 
+        # Place SL/TP orders on Binance FIRST — trade only recorded if both succeed
+        pos_side = direction if getattr(self.config, 'hedge_mode', True) else None
+        sl_side = "SELL" if direction == "LONG" else "BUY"
+        tp2_price = decision.get("take_profit2", 0) or tp_price
+
+        # --- SL order (mandatory) ---
+        sl_placed = False
+        try:
+            self.client.place_order(
+                pair, sl_side, fill_qty,
+                order_type="STOP_MARKET", price=sl_price,
+                position_side=pos_side)
+            logger.info(f"[Futures] SL order placed {pair} @ ${sl_price:,.2f}")
+            sl_placed = True
+        except Exception as e:
+            logger.error(f"[Futures] SL order FAILED {pair} @ ${sl_price:,.2f}: {e}")
+
+        if not sl_placed:
+            # SL failed — close the position immediately, no unprotected trades
+            logger.error(f"[Futures] CLOSING {direction} {pair} — SL order failed, "
+                         f"cannot hold unprotected position")
+            try:
+                close_side = "SELL" if direction == "LONG" else "BUY"
+                ps = direction if getattr(self.config, 'hedge_mode', True) else None
+                self.client.place_order(pair, close_side, fill_qty,
+                                        reduce_only=not ps, position_side=ps)
+                logger.info(f"[Futures] Emergency close {pair} done")
+            except Exception as close_e:
+                logger.error(f"[Futures] Emergency close FAILED {pair}: {close_e}")
+            return
+
+        # --- TP order (mandatory) ---
+        tp_placed = False
+        try:
+            self.client.place_order(
+                pair, sl_side, fill_qty,
+                order_type="TAKE_PROFIT_MARKET", price=tp2_price,
+                position_side=pos_side)
+            logger.info(f"[Futures] TP order placed {pair} @ ${tp2_price:,.2f}")
+            tp_placed = True
+        except Exception as e:
+            logger.error(f"[Futures] TP order FAILED {pair} @ ${tp2_price:,.2f}: {e}")
+
+        if not tp_placed:
+            # TP failed — close position and cancel SL order
+            logger.error(f"[Futures] CLOSING {direction} {pair} — TP order failed, "
+                         f"cannot hold without TP")
+            try:
+                # Cancel the SL order we just placed
+                open_orders = self.client.get_open_orders(pair)
+                for oo in open_orders:
+                    if oo.get("type") == "STOP_MARKET":
+                        self.client.cancel_order(pair, oo["orderId"])
+                # Close the position
+                close_side = "SELL" if direction == "LONG" else "BUY"
+                ps = direction if getattr(self.config, 'hedge_mode', True) else None
+                self.client.place_order(pair, close_side, fill_qty,
+                                        reduce_only=not ps, position_side=ps)
+                logger.info(f"[Futures] Emergency close {pair} done (TP failed)")
+            except Exception as close_e:
+                logger.error(f"[Futures] Emergency close FAILED {pair}: {close_e}")
+            return
+
+        # Both SL and TP placed successfully — now record the trade
         self.store.open_trade(
             symbol=symbol, side=order_side,
             entry_price=fill_price, quantity=fill_qty,
@@ -2795,31 +2953,6 @@ class FuturesEngine:
             liquidation_price=liq_price,
             margin_used=position_usdt,
         )
-
-        # Place SL/TP orders on Binance (TP uses TP2 = full close target)
-        pos_side = direction if getattr(self.config, 'hedge_mode', True) else None
-        sl_side = "SELL" if direction == "LONG" else "BUY"
-        tp2_price = decision.get("take_profit2", 0) or tp_price
-
-        if sl_price > 0:
-            try:
-                self.client.place_order(
-                    pair, sl_side, fill_qty,
-                    order_type="STOP_MARKET", price=sl_price,
-                    position_side=pos_side)
-                logger.info(f"[Futures] SL order placed {pair} @ ${sl_price:,.2f}")
-            except Exception as e:
-                logger.warning(f"[Futures] SL order failed {pair}: {e}")
-
-        if tp2_price > 0:
-            try:
-                self.client.place_order(
-                    pair, sl_side, fill_qty,
-                    order_type="TAKE_PROFIT_MARKET", price=tp2_price,
-                    position_side=pos_side)
-                logger.info(f"[Futures] TP order placed {pair} @ ${tp2_price:,.2f}")
-            except Exception as e:
-                logger.warning(f"[Futures] TP order failed {pair}: {e}")
 
     def _execute_close(self, symbol: str, decision: dict):
         """Close entire position (LONG or SHORT)."""
@@ -3008,6 +3141,31 @@ class FuturesEngine:
 
         self.store.add_dca(trade_id=trade_id, add_price=fill_price, add_qty=fill_qty)
         trade["margin_used"] = trade.get("margin_used", 0) + dca_usdt
+
+        # Recalculate SL based on new average entry (direction-aware)
+        new_entry = trade["entry_price"]  # Already updated by add_dca
+        direction = trade.get("direction", "LONG")
+        atr_value = decision.get("atr", 0)
+        sl_mult = self.config.stop_loss_atr_mult
+
+        if direction == "LONG":
+            if atr_value > 0:
+                new_sl = new_entry - atr_value * sl_mult
+            else:
+                new_sl = new_entry * (1 - 0.02 * sl_mult)
+            # Only widen SL (move down) for LONG — never tighten on DCA
+            if new_sl < trade["stop_loss"]:
+                self.store.update_sl_tp(trade_id, new_sl=new_sl)
+                logger.info(f"[Futures] DCA SL updated {symbol} LONG: ${new_sl:,.2f}")
+        else:  # SHORT
+            if atr_value > 0:
+                new_sl = new_entry + atr_value * sl_mult
+            else:
+                new_sl = new_entry * (1 + 0.02 * sl_mult)
+            # Only widen SL (move up) for SHORT — never tighten on DCA
+            if new_sl > trade["stop_loss"]:
+                self.store.update_sl_tp(trade_id, new_sl=new_sl)
+                logger.info(f"[Futures] DCA SL updated {symbol} SHORT: ${new_sl:,.2f}")
 
     def _execute_adjust_sl(self, decision: dict):
         trade_id = decision.get("trade_id", "")
